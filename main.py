@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════╗
-║          VELTRA MUSIC BOT  —  discord.py               ║
+║          VELTRA MUSIC BOT  —  discord.py             ║
 ║   Play · Queue · Filters · Lyrics · 24/7 · DJ Role  ║
 ╚══════════════════════════════════════════════════════╝
 """
@@ -16,7 +16,6 @@ import random
 import sqlite3
 import aiohttp
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -36,8 +35,8 @@ bot_start_time = time.time()
 # ──────────────────────────────────────────────────────
 #  THEME
 # ──────────────────────────────────────────────────────
-C_LUNA   = 0xB5179E   # signature purple-pink
-C_DARK   = 0x560BAD   # deep purple
+C_LUNA   = 0xB5179E
+C_DARK   = 0x560BAD
 C_GREEN  = 0x57F287
 C_RED    = 0xED4245
 C_YELLOW = 0xFEE75C
@@ -133,15 +132,14 @@ FILTERS: dict[str, dict] = {
 #  SONG & PLAYER
 # ──────────────────────────────────────────────────────
 class Song:
-    def __init__(self, data: dict, requester: discord.Member, source: str = "soundcloud"):
+    def __init__(self, data: dict, requester: discord.Member):
         self.title      = data.get("title", "Unknown")
         self.url        = data.get("webpage_url") or data.get("original_url") or data.get("url", "")
-        self.stream_url = data.get("url", "")      # direct audio URL (may be empty for flat entries)
+        self.stream_url = data.get("url", "")
         self.duration   = data.get("duration") or 0
         self.thumbnail  = data.get("thumbnail", "")
         self.uploader   = data.get("uploader") or data.get("channel", "Unknown")
         self.requester  = requester
-        self.source     = source  # "soundcloud" or "youtube"
 
     @property
     def dur_str(self) -> str:
@@ -151,35 +149,31 @@ class Song:
         h, m = divmod(m, 60)
         return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
-    @property
-    def source_icon(self) -> str:
-        return "☁️" if self.source == "soundcloud" else "▶️"
-
     def progress_bar(self, elapsed: float, length: int = 13) -> str:
         if not self.duration:
             return "─" * length + " 🔴"
-        pct   = min(elapsed / self.duration, 1.0)
-        fill  = int(pct * length)
-        tail  = max(0, length - fill - 1)
-        return "▬" * fill + "🔘" + "▬" * tail
+        pct  = min(elapsed / self.duration, 1.0)
+        fill = int(pct * length)
+        return "▬" * fill + "🔘" + "▬" * (length - fill)
 
 
 class MusicPlayer:
     def __init__(self, guild_id: int):
-        self.guild_id  = guild_id
-        self.queue:    list[Song] = []
-        self.current:  Song | None = None
-        self.history:  list[Song] = []
-        self.loop      = "off"          # off | track | queue
-        self.volume    = 1.0
-        self.filter    = "none"
-        self.skip_votes: set[int] = set()
-        self.tfs       = False
-        self.autoplay  = False
-        self._start:   float | None = None
-        self._paused_at: float | None = None
-        self._elapsed_pre: float = 0.0
-        self.np_msg:   discord.Message | None = None
+        self.guild_id        = guild_id
+        self.queue:          list[Song] = []
+        self.current:        Song | None = None
+        self.history:        list[Song] = []
+        self.loop            = "off"        # off | track | queue
+        self.volume          = 1.0
+        self.filter          = "none"
+        self.skip_votes:     set[int] = set()
+        self.tfs             = False
+        self.autoplay        = False
+        self._start:         float | None = None
+        self._paused_at:     float | None = None
+        self._elapsed_pre:   float = 0.0
+        self.np_msg:         discord.Message | None = None
+        self._changing_filter: bool = False   # guard against setfilter race condition
 
     def elapsed(self) -> float:
         if self._start is None:
@@ -189,9 +183,9 @@ class MusicPlayer:
         return self._elapsed_pre + (time.time() - self._start)
 
     def reset_timer(self):
-        self._start         = time.time()
-        self._paused_at     = None
-        self._elapsed_pre   = 0.0
+        self._start       = time.time()
+        self._paused_at   = None
+        self._elapsed_pre = 0.0
 
 
 # guild_id → MusicPlayer
@@ -209,166 +203,113 @@ def get_player(guild_id: int) -> MusicPlayer:
     return players[guild_id]
 
 # ──────────────────────────────────────────────────────
-#  YT-DLP  —  SoundCloud primary · YouTube web_embedded fallback
-#  SoundCloud: no bot-detection, huge library
-#  YouTube:    web_embedded client bypasses server-IP bot checks
+#  YT-DLP
 # ──────────────────────────────────────────────────────
-_executor = ThreadPoolExecutor(max_workers=6)
-
-_SC_BASE = {
-    "format":             "bestaudio[ext=opus]/bestaudio[ext=mp3]/bestaudio[ext=m4a]/bestaudio/best",
-    "noplaylist":         True,
-    "nocheckcertificate": True,
-    "ignoreerrors":       False,
-    "quiet":              True,
-    "no_warnings":        True,
-    "source_address":     "0.0.0.0",
-    "socket_timeout":     20,
-}
-
-_YT_BASE = {
-    **_SC_BASE,
+_BASE_OPTS = {
+    "format": "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
+    "quiet": True,
+    "no_warnings": True,
+    "socket_timeout": 30,
+    "source_address": "0.0.0.0",
+    "age_limit": 99,           # allow age-restricted videos
+    "ignoreerrors": False,
+    # Try multiple player clients so almost every video is reachable
     "extractor_args": {
-        "youtube": {"player_client": ["web_embedded", "tv_embedded"]}
+        "youtube": {
+            "player_client": ["android", "ios", "web"],
+        }
     },
-    **({"cookiefile": "cookies.txt"} if os.path.exists("cookies.txt") else {}),
+    "http_headers": {
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.6261.119 Mobile Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    },
 }
 
-_SC_SEARCH_OPTS  = {**_SC_BASE, "extract_flat": True,  "skip_download": True, "noplaylist": False, "ignoreerrors": True}
-_YT_SEARCH_OPTS  = {**_YT_BASE, "extract_flat": True,  "skip_download": True, "noplaylist": False, "ignoreerrors": True}
-_SC_RESOLVE      = {**_SC_BASE, "ignoreerrors": False}
-_YT_RESOLVE      = {**_YT_BASE, "ignoreerrors": False}
-_SC_PL_RESOLVE   = {**_SC_BASE, "noplaylist": False, "ignoreerrors": True}
-_YT_PL_RESOLVE   = {**_YT_BASE, "noplaylist": False, "ignoreerrors": True}
+# Fallback opts used when the primary request is blocked
+_FALLBACK_OPTS = {
+    **_BASE_OPTS,
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["ios", "android_embedded", "mweb"],
+        }
+    },
+}
 
-FFMPEG_BEFORE = (
-    "-reconnect 1 -reconnect_streamed 1 "
-    "-reconnect_delay_max 5 "
-    "-protocol_whitelist file,http,https,tcp,tls,crypto"
-)
-FFMPEG_OPTS_BASE = "-vn -acodec pcm_s16le -ar 48000 -ac 2"
+async def _run_in_executor(fn):
+    """Run a blocking function in a thread pool without blocking the event loop."""
+    return await asyncio.get_running_loop().run_in_executor(None, fn)
 
-def _is_drm(e: Exception) -> bool:
-    msg = str(e).lower()
-    return any(k in msg for k in ("drm", "go+", "protected", "premium"))
+def _is_bot_blocked(err: Exception) -> bool:
+    """Return True when YouTube is rate-limiting / bot-detecting us."""
+    msg = str(err).lower()
+    return any(k in msg for k in ("sign in", "bot", "confirm", "cookies", "private video"))
 
-def _ytdl_extract(opts: dict, url: str) -> dict | None:
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
+async def yt_search(query: str) -> list[dict]:
+    """Return up to 5 YouTube search results with automatic fallback."""
+    def _do(opts):
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"ytsearch10:{query}", download=False)
+            return info.get("entries", [info])
 
-async def _run(fn):
-    return await asyncio.get_event_loop().run_in_executor(_executor, fn)
-
-async def _sc_search(query: str, requester: discord.Member) -> Song | None:
-    """Search SoundCloud, skip DRM tracks, return first playable Song."""
-    try:
-        raw = await _run(lambda: _ytdl_extract(_SC_SEARCH_OPTS, f"scsearch5:{query}"))
-    except Exception:
-        return None
-    entries = [e for e in (raw.get("entries") or []) if e] if raw else []
-    for i, entry in enumerate(entries):
-        ref = entry.get("webpage_url") or entry.get("url", "")
-        if not ref:
-            continue
+    # Try primary opts, then fall back to alternate player clients
+    for base in (_BASE_OPTS, _FALLBACK_OPTS):
+        opts = {**base, "noplaylist": True, "default_search": "ytsearch10"}
         try:
-            data = await _run(lambda u=ref: _ytdl_extract(_SC_RESOLVE, u))
-            if data and data.get("url"):
-                print(f"[SC] ✅ {data.get('title','?')[:60]}")
-                return Song(data, requester, source="soundcloud")
+            return await _run_in_executor(lambda o=opts: _do(o))
         except Exception as e:
-            if _is_drm(e):
-                print(f"[SC] #{i+1} DRM — skipping")
+            if _is_bot_blocked(e):
                 continue
-    return None
+            raise
+    raise RuntimeError("YouTube is blocking requests. Try again in a moment.")
 
-async def _yt_search(query: str, requester: discord.Member) -> Song | None:
-    """Search YouTube via web_embedded client (no bot-check on server IPs)."""
-    try:
-        raw = await _run(lambda: _ytdl_extract(_YT_SEARCH_OPTS, f"ytsearch5:{query}"))
-    except Exception:
-        return None
-    entries = [e for e in (raw.get("entries") or []) if e] if raw else []
-    for i, entry in enumerate(entries):
-        ref = entry.get("webpage_url") or entry.get("url", "")
-        if not ref:
-            continue
+async def yt_resolve(url: str) -> dict:
+    """Resolve a video URL to full info with automatic fallback."""
+    def _do(opts):
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    for base in (_BASE_OPTS, _FALLBACK_OPTS):
+        opts = {**base, "noplaylist": True}
         try:
-            data = await _run(lambda u=ref: _ytdl_extract(_YT_RESOLVE, u))
-            if data and data.get("url"):
-                print(f"[YT] ✅ {data.get('title','?')[:60]}")
-                return Song(data, requester, source="youtube")
+            return await _run_in_executor(lambda o=opts: _do(o))
         except Exception as e:
-            print(f"[YT] #{i+1} failed: {e}")
-    return None
-
-async def resolve_query(query: str, requester: discord.Member) -> list[Song]:
-    """Resolve a search query or URL → list of Songs."""
-    is_url = query.startswith(("http://", "https://"))
-
-    if is_url:
-        is_sc = "soundcloud.com" in query
-        is_pl = "playlist" in query or "list=" in query or "/sets/" in query
-        if is_pl:
-            opts = _SC_PL_RESOLVE if is_sc else _YT_PL_RESOLVE
-        else:
-            opts = _SC_RESOLVE if is_sc else _YT_RESOLVE
-        source = "soundcloud" if is_sc else "youtube"
-        try:
-            data = await _run(lambda: _ytdl_extract(opts, query))
-        except Exception as e:
-            print(f"[resolve] URL failed: {e}")
-            return []
-        if not data:
-            return []
-        entries = data.get("entries") or [data]
-        songs   = []
-        for e in entries:
-            if not e:
+            if _is_bot_blocked(e):
                 continue
-            if not e.get("url") or e.get("_type") == "url":
-                ref = e.get("webpage_url") or e.get("url", "")
-                if not ref:
-                    continue
-                try:
-                    e = await _run(lambda u=ref: _ytdl_extract(
-                        _SC_RESOLVE if is_sc else _YT_RESOLVE, u
-                    ))
-                except Exception as ex:
-                    if _is_drm(ex):
-                        print("[resolve] DRM — skipping")
-                    continue
-            if e and e.get("url"):
-                songs.append(Song(e, requester, source=source))
-        return songs
+            raise
+    raise RuntimeError("YouTube is blocking requests. Try again in a moment.")
 
-    # Text search: SoundCloud first, YouTube fallback
-    song = await _sc_search(query, requester)
-    if not song:
-        print(f"[search] SC failed, trying YouTube for: {query[:60]}")
-        song = await _yt_search(query, requester)
-    return [song] if song else []
+async def yt_playlist(url: str) -> list[dict]:
+    """Return flat playlist entries with automatic fallback."""
+    def _do(opts):
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if "entries" in info:
+                return [e for e in info["entries"] if e and e.get("id")]
+            return [info]
 
-async def resolve_stream(song: Song) -> str:
-    """Fetch a fresh CDN stream URL right before playing (CDN URLs expire)."""
-    opts = _SC_RESOLVE if song.source == "soundcloud" else _YT_RESOLVE
-    ref  = song.url or song.stream_url
-    data = await _run(lambda: _ytdl_extract(opts, ref))
-    if not data:
-        raise RuntimeError("yt-dlp returned nothing")
-    if "entries" in data:
-        entries = [e for e in (data.get("entries") or []) if e]
-        if not entries:
-            raise RuntimeError("No playable entries")
-        data = entries[0]
-    url = data.get("url", "")
-    if not url:
-        raise RuntimeError("No stream URL — track may be restricted or unavailable")
-    return url
+    for base in (_BASE_OPTS, _FALLBACK_OPTS):
+        opts = {**base, "extract_flat": "in_playlist", "noplaylist": False}
+        try:
+            return await _run_in_executor(lambda o=opts: _do(o))
+        except Exception as e:
+            if _is_bot_blocked(e):
+                continue
+            raise
+    raise RuntimeError("YouTube is blocking requests. Try again in a moment.")
 
 def _make_ffmpeg_source(stream_url: str, volume: float, audio_filter: str) -> discord.PCMVolumeTransformer:
-    af      = FILTERS.get(audio_filter, FILTERS["none"])["af"]
-    options = FFMPEG_OPTS_BASE + (f" -af {af}" if af else "")
-    src = discord.FFmpegPCMAudio(stream_url, before_options=FFMPEG_BEFORE, options=options)
+    af = FILTERS.get(audio_filter, FILTERS["none"])["af"]
+    options = "-vn" + (f" -af {af}" if af else "")
+    src = discord.FFmpegPCMAudio(
+        stream_url,
+        before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+        options=options,
+    )
     return discord.PCMVolumeTransformer(src, volume=volume)
 
 # ──────────────────────────────────────────────────────
@@ -387,7 +328,7 @@ async def play_next(guild_id: int, channel: discord.abc.Messageable, vc: discord
         song = player.queue.pop(0) if player.queue else None
 
     if song is None:
-        # Queue empty
+        # Queue empty — save to history then wait before auto-disconnect
         if player.current:
             push_history(
                 guild_id,
@@ -399,7 +340,7 @@ async def play_next(guild_id: int, channel: discord.abc.Messageable, vc: discord
         player.current = None
         player.np_msg  = None
         if not player.tfs:
-            await asyncio.sleep(300)   # wait 5 min before auto-disconnect
+            await asyncio.sleep(300)
             p2 = get_player(guild_id)
             if not p2.current and not p2.queue and vc.is_connected():
                 await vc.disconnect()
@@ -412,7 +353,7 @@ async def play_next(guild_id: int, channel: discord.abc.Messageable, vc: discord
                 )
         return
 
-    # Push finished song to history (if not looping track)
+    # Push finished song to history (only when not looping the same track)
     if player.current and player.current is not song:
         push_history(
             guild_id,
@@ -428,34 +369,43 @@ async def play_next(guild_id: int, channel: discord.abc.Messageable, vc: discord
     player.current = song
     player.skip_votes.clear()
 
-    # Always fetch a fresh CDN stream URL right before playing (URLs expire)
-    try:
-        song.stream_url = await resolve_stream(song)
-    except Exception as e:
-        is_drm = _is_drm(e)
-        desc   = "DRM protected — skipping…" if is_drm else str(e)[:140]
-        await channel.send(embed=discord.Embed(color=C_RED, description=f"⚠️ **{song.title[:60]}** — {desc}"))
-        asyncio.ensure_future(play_next(guild_id, channel, vc))
-        return
+    # Resolve stream URL for flat playlist entries
+    if not song.stream_url or "googlevideo" not in song.stream_url:
+        try:
+            data = await yt_resolve(song.url)
+            song.stream_url = data.get("url", "")
+            song.thumbnail  = song.thumbnail or data.get("thumbnail", "")
+            song.duration   = song.duration   or data.get("duration", 0)
+            song.uploader   = song.uploader   or data.get("uploader") or data.get("channel", "Unknown")
+        except Exception as e:
+            await channel.send(embed=discord.Embed(
+                color=C_RED,
+                description=f"⚠️ Skipping **{song.title}** — couldn't resolve stream: {e}"
+            ))
+            await play_next(guild_id, channel, vc)
+            return
 
-    # Build source
+    # Build FFmpeg source
     try:
         source = _make_ffmpeg_source(song.stream_url, player.volume, player.filter)
     except Exception as e:
         await channel.send(embed=discord.Embed(color=C_RED, description=f"⚠️ FFmpeg error: {e}"))
-        asyncio.ensure_future(play_next(guild_id, channel, vc))
+        await play_next(guild_id, channel, vc)
         return
 
     player.reset_timer()
 
     def after_cb(err):
         if err:
-            print(f"[Luna] Player error: {err}")
+            print(f"[Veltra] Player error: {err}")
+        # Skip if setfilter is restarting the source — avoids double-play race condition
+        if get_player(guild_id)._changing_filter:
+            return
         asyncio.run_coroutine_threadsafe(play_next(guild_id, channel, vc), bot.loop)
 
     vc.play(source, after=after_cb)
 
-    # Send / update Now Playing message
+    # Send / update Now Playing embed
     embed = build_np_embed(player, vc)
     view  = NowPlayingView(player, vc)
     try:
@@ -481,10 +431,10 @@ def build_np_embed(player: MusicPlayer, vc: discord.VoiceClient) -> discord.Embe
 
     e = discord.Embed(color=C_LUNA)
     e.set_author(name="🎵 Now Playing")
-    e.title       = song.title
-    e.url         = song.url
+    e.title = song.title
+    e.url   = song.url
 
-    bar  = song.progress_bar(elapsed)
+    bar      = song.progress_bar(elapsed)
     time_str = f"`{_fmt_time(elapsed)}` {bar} `{song.dur_str}`"
     e.description = time_str
 
@@ -492,19 +442,19 @@ def build_np_embed(player: MusicPlayer, vc: discord.VoiceClient) -> discord.Embe
     vol_icon  = "🔇" if player.volume == 0 else ("🔉" if player.volume < 0.5 else "🔊")
     flt_label = FILTERS.get(player.filter, FILTERS["none"])["label"]
 
-    e.add_field(name="🎙️ Artist",   value=song.uploader,            inline=True)
-    e.add_field(name="⏱️ Length",   value=song.dur_str,             inline=True)
+    e.add_field(name="🎙️ Artist",      value=song.uploader,             inline=True)
+    e.add_field(name="⏱️ Length",      value=song.dur_str,              inline=True)
     e.add_field(name=f"{vol_icon} Vol", value=f"{int(player.volume*100)}%", inline=True)
-    e.add_field(name="🔁 Loop",     value=loop_icon,                inline=True)
-    e.add_field(name="🎛️ Filter",   value=flt_label,                inline=True)
-    e.add_field(name="📋 Queue",    value=str(len(player.queue)),   inline=True)
-    e.add_field(name="👤 Requested by", value=song.requester.mention, inline=False)
+    e.add_field(name="🔁 Loop",        value=loop_icon,                 inline=True)
+    e.add_field(name="🎛️ Filter",      value=flt_label,                 inline=True)
+    e.add_field(name="📋 Queue",       value=str(len(player.queue)),    inline=True)
+    e.add_field(name="👤 Requested by", value=song.requester.mention,   inline=False)
 
     if song.thumbnail:
         e.set_thumbnail(url=song.thumbnail)
 
     status = "⏸ Paused" if paused else "▶️ Playing"
-    e.set_footer(text=f"Luna Music  •  {status}  •  Use buttons to control")
+    e.set_footer(text=f"Veltra Music  •  {status}  •  Use buttons to control")
     return e
 
 # ──────────────────────────────────────────────────────
@@ -518,13 +468,14 @@ class NowPlayingView(discord.ui.View):
         paused      = vc.is_paused() if vc else False
 
         row0 = [
-            ("⏮️", "prev",    discord.ButtonStyle.secondary, 0),
-            ("⏸️" if not paused else "▶️", "pause", discord.ButtonStyle.primary,   0),
-            ("⏭️", "skip",    discord.ButtonStyle.secondary, 0),
-            ("⏹️", "stop",    discord.ButtonStyle.danger,    0),
+            ("⏮️", "prev",  discord.ButtonStyle.secondary, 0),
+            ("▶️" if paused else "⏸️", "pause", discord.ButtonStyle.primary, 0),
+            ("⏭️", "skip",  discord.ButtonStyle.secondary, 0),
+            ("⏹️", "stop",  discord.ButtonStyle.danger,    0),
         ]
         row1 = [
-            ("🔂" if player.loop == "track" else "🔁" if player.loop == "queue" else "➡️", "loop", discord.ButtonStyle.secondary, 1),
+            ("🔂" if player.loop == "track" else "🔁" if player.loop == "queue" else "➡️",
+             "loop", discord.ButtonStyle.secondary, 1),
             ("🔀", "shuffle", discord.ButtonStyle.secondary, 1),
             ("❤️", "grab",    discord.ButtonStyle.secondary, 1),
             ("📋", "queue",   discord.ButtonStyle.secondary, 1),
@@ -535,7 +486,14 @@ class NowPlayingView(discord.ui.View):
 
 class _NPBtn(discord.ui.Button):
     def __init__(self, emoji: str, action: str, style: discord.ButtonStyle, row: int):
-        super().__init__(emoji=emoji, style=style, custom_id=f"luna_np_{action}", row=row)
+        # Use guild-agnostic unique IDs by including a random suffix so buttons
+        # across multiple guild messages don't collide in persistent views.
+        super().__init__(
+            emoji=emoji,
+            style=style,
+            custom_id=f"veltra_np_{action}_{random.randint(0, 9999999)}",
+            row=row,
+        )
         self.action = action
 
     async def callback(self, interaction: discord.Interaction):
@@ -567,12 +525,13 @@ class _NPBtn(discord.ui.Button):
             player.loop = "off"
             vc.stop()
             await interaction.response.send_message(
-                embed=discord.Embed(color=C_GREEN, description="⏹️ Stopped and cleared the queue."), ephemeral=True
+                embed=discord.Embed(color=C_GREEN, description="⏹️ Stopped and cleared the queue."),
+                ephemeral=True,
             )
             return
 
         elif self.action == "loop":
-            modes = ["off", "track", "queue"]
+            modes       = ["off", "track", "queue"]
             player.loop = modes[(modes.index(player.loop) + 1) % 3]
             save_settings(interaction.guild.id, loop_mode=player.loop)
 
@@ -585,7 +544,8 @@ class _NPBtn(discord.ui.Button):
 
         elif self.action == "grab":
             song = player.current
-            e    = discord.Embed(color=C_LUNA, title="❤️ Saved Song", description=f"**[{song.title}]({song.url})**")
+            e    = discord.Embed(color=C_LUNA, title="❤️ Saved Song",
+                                 description=f"**[{song.title}]({song.url})**")
             e.add_field(name="Duration", value=song.dur_str, inline=True)
             e.add_field(name="Channel",  value=song.uploader, inline=True)
             if song.thumbnail:
@@ -593,11 +553,14 @@ class _NPBtn(discord.ui.Button):
             try:
                 await interaction.user.send(embed=e)
                 await interaction.response.send_message(
-                    embed=discord.Embed(color=C_GREEN, description="❤️ Song info sent to your DMs!"), ephemeral=True
+                    embed=discord.Embed(color=C_GREEN, description="❤️ Song info sent to your DMs!"),
+                    ephemeral=True,
                 )
             except discord.Forbidden:
                 await interaction.response.send_message(
-                    embed=discord.Embed(color=C_RED, description="❌ I can't DM you. Enable DMs from server members."), ephemeral=True
+                    embed=discord.Embed(color=C_RED,
+                                        description="❌ I can't DM you. Enable DMs from server members."),
+                    ephemeral=True,
                 )
             return
 
@@ -605,11 +568,14 @@ class _NPBtn(discord.ui.Button):
             q = player.queue
             if not q:
                 return await interaction.response.send_message(
-                    embed=discord.Embed(color=C_LUNA, title="📋 Queue", description="The queue is empty."), ephemeral=True
+                    embed=discord.Embed(color=C_LUNA, title="📋 Queue",
+                                        description="The queue is empty."),
+                    ephemeral=True,
                 )
-            lines  = [f"`{i+1}.` [{s.title}]({s.url}) `{s.dur_str}`" for i, s in enumerate(q[:10])]
-            extra  = f"\n*+{len(q)-10} more...*" if len(q) > 10 else ""
-            e      = discord.Embed(color=C_LUNA, title=f"📋 Queue — {len(q)} song(s)", description="\n".join(lines) + extra)
+            lines = [f"`{i+1}.` [{s.title}]({s.url}) `{s.dur_str}`" for i, s in enumerate(q[:10])]
+            extra = f"\n*+{len(q)-10} more...*" if len(q) > 10 else ""
+            e     = discord.Embed(color=C_LUNA, title=f"📋 Queue — {len(q)} song(s)",
+                                  description="\n".join(lines) + extra)
             return await interaction.response.send_message(embed=e, ephemeral=True)
 
         elif self.action == "prev":
@@ -621,7 +587,8 @@ class _NPBtn(discord.ui.Button):
                 vc.stop()
             else:
                 return await interaction.response.send_message(
-                    embed=discord.Embed(color=C_RED, description="❌ No previous song!"), ephemeral=True
+                    embed=discord.Embed(color=C_RED, description="❌ No previous song!"),
+                    ephemeral=True,
                 )
 
         # Refresh NP embed
@@ -650,34 +617,24 @@ async def _ensure_voice(ctx: commands.Context) -> discord.VoiceClient | None:
         await ctx.send(embed=err("You must be in a voice channel!"))
         return None
     vc = ctx.voice_client
-    try:
-        if not vc:
+    if not vc:
+        try:
             vc = await ctx.author.voice.channel.connect()
-        elif ctx.author.voice.channel != vc.channel:
-            await vc.move_to(ctx.author.voice.channel)
-    except RuntimeError as e:
-        msg = str(e).lower()
-        if "nacl" in msg or "library" in msg or "voice" in msg:
-            await ctx.send(embed=err(
-                "❌ Voice library (PyNaCl) is not installed on this server.\n"
-                "The bot owner needs to run: `pip install PyNaCl`"
-            ))
-        else:
-            await ctx.send(embed=err(f"Failed to join voice: {e}"))
-        return None
-    except discord.ClientException as e:
-        await ctx.send(embed=err(f"Could not connect to voice channel: {e}"))
-        return None
-    except Exception as e:
-        await ctx.send(embed=err(f"Voice connection error: {e}"))
-        return None
+        except discord.ClientException as e:
+            await ctx.send(embed=err(f"Could not connect to voice channel: {e}"))
+            return None
+        except asyncio.TimeoutError:
+            await ctx.send(embed=err("Timed out connecting to voice channel."))
+            return None
+    elif ctx.author.voice.channel != vc.channel:
+        await vc.move_to(ctx.author.voice.channel)
     return vc
 
 async def _dj_check(ctx: commands.Context) -> bool:
     if ctx.author.guild_permissions.manage_guild:
         return True
-    s      = get_settings(ctx.guild.id)
-    dj_id  = s.get("dj_role_id")
+    s     = get_settings(ctx.guild.id)
+    dj_id = s.get("dj_role_id")
     if dj_id:
         role = ctx.guild.get_role(int(dj_id))
         if role and role in ctx.author.roles:
@@ -686,6 +643,13 @@ async def _dj_check(ctx: commands.Context) -> bool:
         await ctx.send(embed=err(f"You need the **{name}** DJ role to use this command!"))
         return False
     return True
+
+def _dur(seconds) -> str:
+    if not seconds:
+        return "?"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 # ──────────────────────────────────────────────────────
 #  COMMANDS — PLAYBACK
@@ -703,7 +667,8 @@ async def disconnect(ctx: commands.Context):
     """Disconnect from voice."""
     if not ctx.voice_client:
         return await ctx.send(embed=err("I'm not in a voice channel!"))
-    if not await _dj_check(ctx): return
+    if not await _dj_check(ctx):
+        return
     player = get_player(ctx.guild.id)
     player.queue.clear()
     ctx.voice_client.stop()
@@ -714,40 +679,76 @@ async def disconnect(ctx: commands.Context):
 
 @bot.command(aliases=["p"])
 async def play(ctx: commands.Context, *, query: str):
-    """Play a song or playlist — SoundCloud first, YouTube fallback."""
+    """Play a song or playlist from YouTube / URL."""
     vc = await _ensure_voice(ctx)
-    if not vc: return
+    if not vc:
+        return
 
     player = get_player(ctx.guild.id)
-    msg    = await ctx.send(embed=discord.Embed(color=C_LUNA, description=f"🔍 Searching **{query}**..."))
+    msg    = await ctx.send(embed=discord.Embed(color=C_LUNA, description=f"🔍 Searching for **{query}**..."))
 
     try:
-        songs = await resolve_query(query, ctx.author)
+        is_url = query.startswith(("http://", "https://"))
+
+        if is_url and ("list=" in query or "playlist" in query.lower()):
+            entries = await yt_playlist(query)
+            if not entries:
+                return await msg.edit(embed=err("Couldn't find anything in that playlist."))
+
+            added = 0
+            for entry in entries:
+                data = {
+                    "title":       entry.get("title") or "Unknown",
+                    "url":         f"https://www.youtube.com/watch?v={entry['id']}",
+                    "webpage_url": f"https://www.youtube.com/watch?v={entry['id']}",
+                    "duration":    entry.get("duration", 0),
+                    "thumbnail":   (entry.get("thumbnail") or
+                                    (entry.get("thumbnails") or [{}])[-1].get("url", "")),
+                    "uploader":    entry.get("uploader") or entry.get("channel", ""),
+                }
+                player.queue.append(Song(data, ctx.author))
+                added += 1
+
+            e = discord.Embed(color=C_LUNA, title="📋 Playlist Added!")
+            e.add_field(name="Songs",        value=str(added),              inline=True)
+            e.add_field(name="Queue length", value=str(len(player.queue)),  inline=True)
+            await msg.edit(embed=e)
+
+        elif is_url:
+            data = await yt_resolve(query)
+            song = Song(data, ctx.author)
+            player.queue.append(song)
+            if vc.is_playing() or vc.is_paused():
+                e = discord.Embed(color=C_LUNA, title="➕ Added to Queue",
+                                  description=f"**[{song.title}]({song.url})**")
+                e.add_field(name="Duration", value=song.dur_str, inline=True)
+                e.add_field(name="Position", value=f"#{len(player.queue)}", inline=True)
+                if song.thumbnail:
+                    e.set_thumbnail(url=song.thumbnail)
+                await msg.edit(embed=e)
+            else:
+                await msg.delete()
+
+        else:
+            results = await yt_search(query)
+            if not results:
+                return await msg.edit(embed=err("No results found!"))
+            data = results[0]
+            song = Song(data, ctx.author)
+            player.queue.append(song)
+            if vc.is_playing() or vc.is_paused():
+                e = discord.Embed(color=C_LUNA, title="➕ Added to Queue",
+                                  description=f"**[{song.title}]({song.url})**")
+                e.add_field(name="Duration", value=song.dur_str, inline=True)
+                e.add_field(name="Position", value=f"#{len(player.queue)}", inline=True)
+                if song.thumbnail:
+                    e.set_thumbnail(url=song.thumbnail)
+                await msg.edit(embed=e)
+            else:
+                await msg.delete()
+
     except Exception as ex:
         return await msg.edit(embed=err(f"Error: {ex}"))
-
-    if not songs:
-        return await msg.edit(embed=err("No results found! Try a different search term or URL."))
-
-    for song in songs:
-        player.queue.append(song)
-
-    if len(songs) > 1:
-        e = discord.Embed(color=C_LUNA, title="📋 Playlist Added!")
-        e.add_field(name="Songs added", value=str(len(songs)), inline=True)
-        e.add_field(name="Queue length", value=str(len(player.queue)), inline=True)
-        await msg.edit(embed=e)
-    else:
-        song = songs[0]
-        if vc.is_playing() or vc.is_paused():
-            e = discord.Embed(color=C_LUNA, title="➕ Added to Queue",
-                              description=f"{song.source_icon} **[{song.title}]({song.url})**")
-            e.add_field(name="Duration", value=song.dur_str, inline=True)
-            e.add_field(name="Position",  value=f"#{len(player.queue)}", inline=True)
-            if song.thumbnail: e.set_thumbnail(url=song.thumbnail)
-            await msg.edit(embed=e)
-        else:
-            await msg.delete()
 
     if not vc.is_playing() and not vc.is_paused():
         await play_next(ctx.guild.id, ctx.channel, vc)
@@ -756,23 +757,21 @@ async def play(ctx: commands.Context, *, query: str):
 @bot.command()
 async def search(ctx: commands.Context, *, query: str):
     """Search YouTube and pick a result."""
-    msg = await ctx.send(embed=discord.Embed(color=C_LUNA, description=f"🔍 Searching SoundCloud for **{query}**..."))
-
-    # Flat search — SoundCloud top 5 titles only (fast)
+    msg = await ctx.send(embed=discord.Embed(color=C_LUNA, description=f"🔍 Searching **{query}**..."))
     try:
-        raw = await _run(lambda: _ytdl_extract(_SC_SEARCH_OPTS, f"scsearch5:{query}"))
+        results = await yt_search(query)
     except Exception as ex:
         return await msg.edit(embed=err(str(ex)))
 
-    results = [e for e in (raw.get("entries") or []) if e][:5] if raw else []
+    results = results[:5]
     if not results:
-        return await msg.edit(embed=err("No results found on SoundCloud!"))
+        return await msg.edit(embed=err("No results found!"))
 
     lines = [
-        f"`{i+1}.` **{r.get('title','?')}** — {r.get('uploader') or r.get('channel','?')} `{_dur(r.get('duration',0))}`"
+        f"`{i+1}.` [{r.get('title','?')}](https://youtu.be/{r.get('id','')}) `{_dur(r.get('duration',0))}`"
         for i, r in enumerate(results)
     ]
-    e = discord.Embed(color=C_LUNA, title="☁️ SoundCloud Search Results", description="\n".join(lines))
+    e = discord.Embed(color=C_LUNA, title="🔍 Search Results", description="\n".join(lines))
     e.set_footer(text="Reply with a number (1-5) to pick  •  or 'cancel'")
     await msg.edit(embed=e)
 
@@ -790,7 +789,7 @@ async def search(ctx: commands.Context, *, query: str):
         pass
 
     if reply.content.lower() == "cancel":
-        return await msg.edit(embed=ok("Cancelled."))
+        return await msg.edit(embed=ok("Cancelled search."))
 
     try:
         idx = int(reply.content) - 1
@@ -800,39 +799,28 @@ async def search(ctx: commands.Context, *, query: str):
         return await msg.edit(embed=err("Invalid selection."))
 
     vc = await _ensure_voice(ctx)
-    if not vc: return
+    if not vc:
+        return
 
     player = get_player(ctx.guild.id)
-    ref = results[idx].get("webpage_url") or results[idx].get("url", "")
-    await msg.edit(embed=discord.Embed(color=C_LUNA, description=f"⏳ Loading **{results[idx].get('title','?')}**..."))
-
+    data   = results[idx]
     try:
-        data = await _run(lambda u=ref: _ytdl_extract(_SC_RESOLVE, u))
+        full = await yt_resolve(f"https://www.youtube.com/watch?v={data['id']}")
     except Exception as ex:
         return await msg.edit(embed=err(str(ex)))
 
-    if not data or not data.get("url"):
-        return await msg.edit(embed=err("Couldn't load that track. It may be DRM-protected."))
-
-    song = Song(data, ctx.author, source="soundcloud")
+    song = Song(full, ctx.author)
     player.queue.append(song)
 
     e2 = discord.Embed(color=C_LUNA, title="➕ Added to Queue",
-                       description=f"☁️ **[{song.title}]({song.url})**")
+                       description=f"**[{song.title}]({song.url})**")
     e2.add_field(name="Duration", value=song.dur_str, inline=True)
-    e2.add_field(name="Position", value=f"#{len(player.queue)}", inline=True)
-    if song.thumbnail: e2.set_thumbnail(url=song.thumbnail)
+    if song.thumbnail:
+        e2.set_thumbnail(url=song.thumbnail)
     await msg.edit(embed=e2)
 
     if not vc.is_playing() and not vc.is_paused():
         await play_next(ctx.guild.id, ctx.channel, vc)
-
-
-def _dur(seconds) -> str:
-    if not seconds: return "?"
-    m, s = divmod(int(seconds), 60)
-    h, m = divmod(m, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 @bot.command(aliases=["pa"])
@@ -841,7 +829,8 @@ async def pause(ctx: commands.Context):
     vc = ctx.voice_client
     if not vc or not vc.is_playing():
         return await ctx.send(embed=err("Nothing is playing!"))
-    if not await _dj_check(ctx): return
+    if not await _dj_check(ctx):
+        return
     player = get_player(ctx.guild.id)
     player._elapsed_pre = player.elapsed()
     player._paused_at   = time.time()
@@ -855,7 +844,8 @@ async def resume(ctx: commands.Context):
     vc = ctx.voice_client
     if not vc or not vc.is_paused():
         return await ctx.send(embed=err("Nothing is paused!"))
-    if not await _dj_check(ctx): return
+    if not await _dj_check(ctx):
+        return
     player = get_player(ctx.guild.id)
     player._elapsed_pre = player.elapsed()
     player._start       = time.time()
@@ -871,39 +861,45 @@ async def skip(ctx: commands.Context):
     if not vc or (not vc.is_playing() and not vc.is_paused()):
         return await ctx.send(embed=err("Nothing is playing!"))
 
-    player  = get_player(ctx.guild.id)
-    is_dj   = ctx.author.guild_permissions.manage_guild
-    s       = get_settings(ctx.guild.id)
-    has_dj  = bool(s.get("dj_role_id"))
+    player = get_player(ctx.guild.id)
+    is_dj  = ctx.author.guild_permissions.manage_guild
+    s      = get_settings(ctx.guild.id)
+    dj_id  = s.get("dj_role_id")
+    has_dj = bool(dj_id)
 
-    if is_dj or (has_dj and ctx.guild.get_role(int(s["dj_role_id"])) in ctx.author.roles):
+    dj_role = ctx.guild.get_role(int(dj_id)) if dj_id else None
+    if is_dj or (has_dj and dj_role and dj_role in ctx.author.roles):
         player.skip_votes.clear()
         vc.stop()
         return await ctx.send(embed=ok("⏭️ Skipped!"))
 
-    # Vote skip: need > 50% of voice members
-    vc_members  = [m for m in vc.channel.members if not m.bot]
-    needed      = max(1, math.ceil(len(vc_members) * 0.5))
+    # Vote skip — need > 50 % of voice members
+    vc_members = [m for m in vc.channel.members if not m.bot]
+    needed     = max(1, math.ceil(len(vc_members) * 0.5))
     player.skip_votes.add(ctx.author.id)
-    votes       = len(player.skip_votes)
+    votes = len(player.skip_votes)
     if votes >= needed:
         player.skip_votes.clear()
         vc.stop()
         await ctx.send(embed=ok(f"⏭️ Vote passed ({votes}/{needed})! Skipped."))
     else:
-        await ctx.send(embed=discord.Embed(color=C_YELLOW, description=f"🗳️ Skip vote: **{votes}/{needed}** — need {needed - votes} more."))
+        await ctx.send(embed=discord.Embed(
+            color=C_YELLOW,
+            description=f"🗳️ Skip vote: **{votes}/{needed}** — need {needed - votes} more.",
+        ))
 
 
 @bot.command(aliases=["vs"])
 async def voteskip(ctx: commands.Context):
     """Cast a skip vote."""
-    await skip(ctx)
+    await ctx.invoke(skip)
 
 
 @bot.command()
 async def stop(ctx: commands.Context):
     """Stop music and clear the queue."""
-    if not await _dj_check(ctx): return
+    if not await _dj_check(ctx):
+        return
     vc = ctx.voice_client
     if not vc:
         return await ctx.send(embed=err("I'm not in a voice channel!"))
@@ -932,9 +928,10 @@ async def nowplaying(ctx: commands.Context):
 async def again(ctx: commands.Context):
     """Replay the current song from the beginning."""
     vc = ctx.voice_client
-    if not vc or not ctx.voice_client.is_playing():
+    if not vc or not vc.is_playing():
         return await ctx.send(embed=err("Nothing is playing!"))
-    if not await _dj_check(ctx): return
+    if not await _dj_check(ctx):
+        return
     player = get_player(ctx.guild.id)
     if not player.current:
         return await ctx.send(embed=err("Nothing is playing!"))
@@ -951,24 +948,30 @@ async def queue(ctx: commands.Context, page: int = 1):
     player = get_player(ctx.guild.id)
 
     if not player.current and not player.queue:
-        return await ctx.send(embed=discord.Embed(color=C_LUNA, title="📋 Queue", description="The queue is empty. Use `$play` to add songs!"))
+        return await ctx.send(embed=discord.Embed(
+            color=C_LUNA, title="📋 Queue",
+            description="The queue is empty. Use `$play` to add songs!",
+        ))
 
-    per_page  = 10
-    pages     = max(1, math.ceil(len(player.queue) / per_page))
-    page      = max(1, min(page, pages))
-    start     = (page - 1) * per_page
-    chunk     = player.queue[start:start + per_page]
+    per_page = 10
+    pages    = max(1, math.ceil(len(player.queue) / per_page))
+    page     = max(1, min(page, pages))
+    start    = (page - 1) * per_page
+    chunk    = player.queue[start:start + per_page]
 
     desc = ""
     if player.current:
-        desc += f"**▶️ Now Playing:**\n[{player.current.title}]({player.current.url}) `{player.current.dur_str}` — {player.current.requester.mention}\n\n"
+        desc += (f"**▶️ Now Playing:**\n"
+                 f"[{player.current.title}]({player.current.url}) "
+                 f"`{player.current.dur_str}` — {player.current.requester.mention}\n\n")
     if chunk:
         desc += "**📋 Up Next:**\n"
-        for i, s in enumerate(chunk, start=start+1):
+        for i, s in enumerate(chunk, start=start + 1):
             desc += f"`{i}.` [{s.title}]({s.url}) `{s.dur_str}` — {s.requester.mention}\n"
 
     total_dur = sum(s.duration or 0 for s in player.queue)
-    e = discord.Embed(color=C_LUNA, title=f"📋 Queue  —  {len(player.queue)} song(s)", description=desc)
+    e         = discord.Embed(color=C_LUNA, title=f"📋 Queue  —  {len(player.queue)} song(s)",
+                              description=desc)
     loop_icon = {"off": "➡️ Off", "track": "🔂 Track", "queue": "🔁 Queue"}[player.loop]
     e.set_footer(text=f"Page {page}/{pages}  •  Total: {_fmt_time(total_dur)}  •  Loop: {loop_icon}")
     await ctx.send(embed=e)
@@ -977,7 +980,8 @@ async def queue(ctx: commands.Context, page: int = 1):
 @bot.command(aliases=["rm"])
 async def remove(ctx: commands.Context, index: int):
     """Remove a song from the queue by position."""
-    if not await _dj_check(ctx): return
+    if not await _dj_check(ctx):
+        return
     player = get_player(ctx.guild.id)
     if index < 1 or index > len(player.queue):
         return await ctx.send(embed=err(f"Invalid position! Queue has {len(player.queue)} songs."))
@@ -988,7 +992,8 @@ async def remove(ctx: commands.Context, index: int):
 @bot.command()
 async def clear(ctx: commands.Context):
     """Clear the entire queue (keeps current song)."""
-    if not await _dj_check(ctx): return
+    if not await _dj_check(ctx):
+        return
     player = get_player(ctx.guild.id)
     player.queue.clear()
     await ctx.send(embed=ok("Queue cleared!"))
@@ -997,7 +1002,8 @@ async def clear(ctx: commands.Context):
 @bot.command(aliases=["sh"])
 async def shuffle(ctx: commands.Context):
     """Shuffle the queue."""
-    if not await _dj_check(ctx): return
+    if not await _dj_check(ctx):
+        return
     player = get_player(ctx.guild.id)
     if len(player.queue) < 2:
         return await ctx.send(embed=err("Need at least 2 songs in the queue to shuffle."))
@@ -1008,9 +1014,10 @@ async def shuffle(ctx: commands.Context):
 @bot.command()
 async def move(ctx: commands.Context, frm: int, to: int):
     """Move a song in the queue: $move <from> <to>"""
-    if not await _dj_check(ctx): return
+    if not await _dj_check(ctx):
+        return
     player = get_player(ctx.guild.id)
-    q = player.queue
+    q      = player.queue
     if not (1 <= frm <= len(q)) or not (1 <= to <= len(q)):
         return await ctx.send(embed=err(f"Positions must be between 1 and {len(q)}."))
     song = q.pop(frm - 1)
@@ -1021,7 +1028,8 @@ async def move(ctx: commands.Context, frm: int, to: int):
 @bot.command()
 async def skipto(ctx: commands.Context, index: int):
     """Skip to a specific position in the queue."""
-    if not await _dj_check(ctx): return
+    if not await _dj_check(ctx):
+        return
     vc = ctx.voice_client
     if not vc:
         return await ctx.send(embed=err("Nothing is playing!"))
@@ -1037,8 +1045,9 @@ async def skipto(ctx: commands.Context, index: int):
 # ──────────────────────────────────────────────────────
 @bot.command(aliases=["vol"])
 async def volume(ctx: commands.Context, vol: int):
-    """Set volume 0-200%: $volume 80"""
-    if not await _dj_check(ctx): return
+    """Set volume 0–200%: $volume 80"""
+    if not await _dj_check(ctx):
+        return
     if not 0 <= vol <= 200:
         return await ctx.send(embed=err("Volume must be between 0 and 200."))
     player = get_player(ctx.guild.id)
@@ -1054,7 +1063,8 @@ async def volume(ctx: commands.Context, vol: int):
 @bot.command()
 async def loop(ctx: commands.Context, mode: str = None):
     """Set loop mode: off / track / queue"""
-    if not await _dj_check(ctx): return
+    if not await _dj_check(ctx):
+        return
     player = get_player(ctx.guild.id)
     modes  = ["off", "track", "queue"]
     if mode is None:
@@ -1071,7 +1081,8 @@ async def loop(ctx: commands.Context, mode: str = None):
 @bot.command(aliases=["filter"])
 async def setfilter(ctx: commands.Context, name: str = None):
     """Apply an audio filter: $filter bassboost"""
-    if not await _dj_check(ctx): return
+    if not await _dj_check(ctx):
+        return
     if name is None:
         lines = [f"`{k}` — {v['label']}" for k, v in FILTERS.items()]
         e = discord.Embed(color=C_LUNA, title="🎛️ Audio Filters", description="\n".join(lines))
@@ -1080,31 +1091,44 @@ async def setfilter(ctx: commands.Context, name: str = None):
 
     name = name.lower()
     if name not in FILTERS:
-        return await ctx.send(embed=err(f"Unknown filter! Use `$filter` to see the list."))
+        return await ctx.send(embed=err("Unknown filter! Use `$filter` to see the list."))
 
     player = get_player(ctx.guild.id)
     player.filter = name
     vc = ctx.voice_client
+
     if vc and (vc.is_playing() or vc.is_paused()) and player.current:
         was_paused = vc.is_paused()
+        paused_pos = player.elapsed()
+
+        # Set flag BEFORE stopping so after_cb ignores the stop
+        player._changing_filter = True
         vc.stop()
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.5)
+
         try:
-            player.current.stream_url = await resolve_stream(player.current)
+            data = await yt_resolve(player.current.url)
+            player.current.stream_url = data.get("url", player.current.stream_url)
         except Exception:
-            pass   # keep existing stream_url, may fail but better than crashing
+            pass
+
         source = _make_ffmpeg_source(player.current.stream_url, player.volume, name)
-        player._elapsed_pre = 0.0
-        player._start       = time.time()
-        player._paused_at   = None
+        player._elapsed_pre     = 0.0
+        player._start           = time.time()
+        player._paused_at       = None
+        player._changing_filter = False   # clear flag before playing new source
 
         def after_cb(err_):
-            asyncio.run_coroutine_threadsafe(play_next(ctx.guild.id, ctx.channel, vc), bot.loop)
+            asyncio.run_coroutine_threadsafe(
+                play_next(ctx.guild.id, ctx.channel, vc), bot.loop
+            )
 
         vc.play(source, after=after_cb)
+
         if was_paused:
             vc.pause()
-            player._paused_at = time.time()
+            player._elapsed_pre = paused_pos
+            player._paused_at   = time.time()
 
     label = FILTERS[name]["label"]
     await ctx.send(embed=ok(f"🎛️ Filter set to **{label}**"))
@@ -1122,7 +1146,8 @@ async def listfilters(ctx: commands.Context):
 @bot.command(name="247")
 async def tfs(ctx: commands.Context):
     """Toggle 24/7 mode (bot stays in VC)."""
-    if not await _dj_check(ctx): return
+    if not await _dj_check(ctx):
+        return
     player = get_player(ctx.guild.id)
     player.tfs = not player.tfs
     save_settings(ctx.guild.id, tfs=int(player.tfs))
@@ -1133,7 +1158,8 @@ async def tfs(ctx: commands.Context):
 @bot.command()
 async def autoplay(ctx: commands.Context):
     """Toggle autoplay (adds related songs when queue ends)."""
-    if not await _dj_check(ctx): return
+    if not await _dj_check(ctx):
+        return
     player = get_player(ctx.guild.id)
     player.autoplay = not player.autoplay
     save_settings(ctx.guild.id, autoplay=int(player.autoplay))
@@ -1163,20 +1189,20 @@ async def lyrics(ctx: commands.Context, *, song_name: str = None):
             return await ctx.send(embed=err("Nothing is playing! Provide a song name: `$lyrics song name`"))
         song_name = player.current.title
 
-    # Clean up the title (remove [Official], (HD), etc.)
     clean = song_name
     for pat in ["(official", "(lyrics", "(audio", "(video", "(hd", "(4k", "[", "]", "ft.", "feat."]:
         if pat in clean.lower():
             clean = clean[:clean.lower().index(pat)].strip()
 
-    # Try lyrics.ovh API
     parts = clean.split(" - ", 1)
     if len(parts) == 2:
         artist, title_q = parts[0].strip(), parts[1].strip()
     else:
         artist, title_q = "", clean.strip()
 
-    msg = await ctx.send(embed=discord.Embed(color=C_LUNA, description=f"🔍 Fetching lyrics for **{clean}**..."))
+    msg = await ctx.send(embed=discord.Embed(
+        color=C_LUNA, description=f"🔍 Fetching lyrics for **{clean}**..."
+    ))
 
     lyrics_text = None
     try:
@@ -1190,7 +1216,6 @@ async def lyrics(ctx: commands.Context, *, song_name: str = None):
         pass
 
     if not lyrics_text:
-        # Try without artist split
         try:
             url = f"https://api.lyrics.ovh/v1/{clean}/{clean}"
             async with aiohttp.ClientSession() as session:
@@ -1202,13 +1227,15 @@ async def lyrics(ctx: commands.Context, *, song_name: str = None):
             pass
 
     if not lyrics_text:
-        return await msg.edit(embed=err(f"Couldn't find lyrics for **{clean}**.\nTry: `$lyrics Artist - Song Title`"))
+        return await msg.edit(embed=err(
+            f"Couldn't find lyrics for **{clean}**.\nTry: `$lyrics Artist - Song Title`"
+        ))
 
-    # Send lyrics in chunks (Discord embed limit 4096)
     lyrics_text = lyrics_text.replace("\r\n", "\n").strip()
-    chunks = [lyrics_text[i:i+3800] for i in range(0, len(lyrics_text), 3800)]
+    chunks = [lyrics_text[i:i + 3800] for i in range(0, len(lyrics_text), 3800)]
     for i, chunk in enumerate(chunks):
-        e = discord.Embed(color=C_LUNA, title=f"📜 {clean}" + (f" (Part {i+1})" if len(chunks) > 1 else ""), description=chunk)
+        title = f"📜 {clean}" + (f" (Part {i+1})" if len(chunks) > 1 else "")
+        e = discord.Embed(color=C_LUNA, title=title, description=chunk)
         e.set_footer(text="Powered by lyrics.ovh")
         if i == 0:
             await msg.edit(embed=e)
@@ -1223,12 +1250,15 @@ async def history(ctx: commands.Context):
     """Show recently played songs."""
     conn = get_db()
     rows = conn.execute(
-        "SELECT title, url, duration, requester, played_at FROM history WHERE guild_id=? ORDER BY id DESC LIMIT 10",
-        (ctx.guild.id,)
+        "SELECT title, url, duration, requester, played_at FROM history "
+        "WHERE guild_id=? ORDER BY id DESC LIMIT 10",
+        (ctx.guild.id,),
     ).fetchall()
     conn.close()
     if not rows:
-        return await ctx.send(embed=discord.Embed(color=C_LUNA, title="📜 History", description="No songs played yet!"))
+        return await ctx.send(embed=discord.Embed(
+            color=C_LUNA, title="📜 History", description="No songs played yet!"
+        ))
     lines = [f"`{i+1}.` [{r['title']}]({r['url']}) `{r['duration']}`" for i, r in enumerate(rows)]
     e = discord.Embed(color=C_LUNA, title="📜 Recently Played", description="\n".join(lines))
     await ctx.send(embed=e)
@@ -1241,7 +1271,8 @@ async def grab(ctx: commands.Context):
     if not player.current:
         return await ctx.send(embed=err("Nothing is playing!"))
     song = player.current
-    e = discord.Embed(color=C_LUNA, title="❤️ Saved Song!", description=f"**[{song.title}]({song.url})**")
+    e = discord.Embed(color=C_LUNA, title="❤️ Saved Song!",
+                      description=f"**[{song.title}]({song.url})**")
     e.add_field(name="Duration", value=song.dur_str, inline=True)
     e.add_field(name="Channel",  value=song.uploader, inline=True)
     if song.thumbnail:
@@ -1269,14 +1300,14 @@ async def botinfo(ctx: commands.Context):
     uptime = int(time.time() - bot_start_time)
     h, rem = divmod(uptime, 3600)
     m, s   = divmod(rem, 60)
-    e = discord.Embed(color=C_LUNA, title="🎵 Luna Music Bot")
-    e.add_field(name="Prefix",   value="`$`",                    inline=True)
-    e.add_field(name="Servers",  value=str(len(bot.guilds)),     inline=True)
-    e.add_field(name="Uptime",   value=f"{h}h {m}m {s}s",       inline=True)
-    e.add_field(name="Library",  value="discord.py",             inline=True)
-    e.add_field(name="Engine",   value="yt-dlp + FFmpeg",        inline=True)
-    e.add_field(name="Filters",  value=str(len(FILTERS)),        inline=True)
-    e.set_footer(text="Luna Music Bot  •  $help for commands")
+    e = discord.Embed(color=C_LUNA, title="🎵 Veltra Music Bot")
+    e.add_field(name="Prefix",   value="`$`",                 inline=True)
+    e.add_field(name="Servers",  value=str(len(bot.guilds)),  inline=True)
+    e.add_field(name="Uptime",   value=f"{h}h {m}m {s}s",    inline=True)
+    e.add_field(name="Library",  value="discord.py",          inline=True)
+    e.add_field(name="Engine",   value="yt-dlp + FFmpeg",     inline=True)
+    e.add_field(name="Filters",  value=str(len(FILTERS)),     inline=True)
+    e.set_footer(text="Veltra Music Bot  •  $help for commands")
     await ctx.send(embed=e)
 
 # ──────────────────────────────────────────────────────
@@ -1324,10 +1355,10 @@ HELP_DATA = [
 
 @bot.command(aliases=["h", "commands"])
 async def help(ctx: commands.Context, *, section: str = None):
-    """Show help for Luna Music Bot."""
+    """Show help for Veltra Music Bot."""
     e = discord.Embed(
         color=C_LUNA,
-        title="🎵 Luna Music Bot — Command List",
+        title="🎵 Veltra Music Bot — Command List",
         description=(
             "A feature-complete music bot. Use `$play <song>` to get started!\n"
             "Interactive **Now Playing** panel: play ▶️ · pause ⏸ · skip ⏭ · loop 🔁 · shuffle 🔀\n\u200b"
@@ -1336,8 +1367,7 @@ async def help(ctx: commands.Context, *, section: str = None):
     for section_name, cmds in HELP_DATA:
         val = "\n".join(f"`{cmd}` — {desc}" for cmd, desc in cmds)
         e.add_field(name=section_name, value=val, inline=False)
-
-    e.set_footer(text="Luna Music Bot  •  Built with discord.py + yt-dlp + FFmpeg")
+    e.set_footer(text="Veltra Music Bot  •  Built with discord.py + yt-dlp + FFmpeg")
     await ctx.send(embed=e)
 
 # ──────────────────────────────────────────────────────
@@ -1345,9 +1375,24 @@ async def help(ctx: commands.Context, *, section: str = None):
 # ──────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
-    print(f"[Luna] Logged in as {bot.user} ({bot.user.id})")
+    print(f"[Veltra] Logged in as {bot.user} ({bot.user.id})")
+
+    # Load libopus — required for voice audio encoding on Linux
+    if not discord.opus.is_loaded():
+        for lib in ("libopus.so.0", "libopus.so", "opus", "libopus"):
+            try:
+                discord.opus.load_opus(lib)
+                print(f"[Veltra] Opus loaded: {lib}")
+                break
+            except OSError:
+                continue
+        if discord.opus.is_loaded():
+            print("[Veltra] Voice (opus) ready.")
+        else:
+            print("[Veltra] WARNING: libopus not found — audio may not play.")
+
     await bot.change_presence(
-        activity=discord.Activity(type=discord.ActivityType.listening, name="$play | Luna Music"),
+        activity=discord.Activity(type=discord.ActivityType.listening, name="$play | Veltra Music"),
         status=discord.Status.online,
     )
     if not refresh_np.is_running():
@@ -1365,10 +1410,9 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     player = get_player(member.guild.id)
     if player.tfs:
         return
-    # Check if bot is alone
     human_members = [m for m in vc.channel.members if not m.bot]
     if len(human_members) == 0:
-        await asyncio.sleep(30)  # wait 30s before leaving
+        await asyncio.sleep(30)
         vc2 = member.guild.voice_client
         if not vc2:
             return
@@ -1382,7 +1426,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
 @tasks.loop(seconds=15)
 async def refresh_np():
-    """Periodically update the Now Playing embed (progress bar)."""
+    """Periodically update the Now Playing embed progress bar."""
     for guild_id, player in list(players.items()):
         if not player.current or not player.np_msg:
             continue
@@ -1403,22 +1447,6 @@ async def refresh_np():
 
 @bot.event
 async def on_command_error(ctx: commands.Context, error):
-    # Unwrap CommandInvokeError to get the real exception
-    if isinstance(error, commands.CommandInvokeError):
-        original = error.original
-        orig_str = str(original).lower()
-        # Voice / nacl library error
-        if isinstance(original, RuntimeError) and ("nacl" in orig_str or "library" in orig_str or "voice" in orig_str):
-            await ctx.send(embed=err(
-                "Voice library (PyNaCl) is missing.\n"
-                "Ask the bot owner to run: `pip install PyNaCl`"
-            ))
-            return
-        # Generic unhandled command error — show clean message
-        await ctx.send(embed=err(f"Something went wrong: {original}"))
-        print(f"[Luna] CommandInvokeError in {ctx.command}: {original}")
-        return
-
     if isinstance(error, commands.MissingRequiredArgument):
         await ctx.send(embed=err(f"Missing argument: `{error.param.name}`"))
     elif isinstance(error, commands.BadArgument):
@@ -1426,15 +1454,15 @@ async def on_command_error(ctx: commands.Context, error):
     elif isinstance(error, commands.MissingPermissions):
         await ctx.send(embed=err("You don't have permission to use this command."))
     elif isinstance(error, commands.CommandNotFound):
-        pass  # Silently ignore unknown commands
+        pass
     else:
-        await ctx.send(embed=err(f"Error: {error}"))
-        print(f"[Luna] Unhandled error in {ctx.command}: {error}")
+        await ctx.send(embed=err(f"An error occurred: {error}"))
+        raise error
 
 # ──────────────────────────────────────────────────────
 #  RUN
 # ──────────────────────────────────────────────────────
 if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN not set! Add it in Replit Secrets.")
+    raise RuntimeError("DISCORD_TOKEN not set! Add it to your Railway environment variables.")
 
 bot.run(TOKEN, log_handler=handler, log_level=logging.WARNING)

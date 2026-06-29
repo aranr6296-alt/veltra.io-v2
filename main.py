@@ -1422,7 +1422,7 @@ async def ping(ctx: commands.Context):
 
 # ── CRASH FIX: was `async def bot()` — shadowed the Bot instance ──
 # ── Renamed to botinfo() — all @bot.command() after it now work   ──
-@bot.command(aliases=["stats", "botinfo", "info"])
+@bot.command(aliases=["stats", "info"])
 async def botinfo(ctx: commands.Context):
     """Show bot stats and info."""
     uptime = int(time.time() - bot_start_time)
@@ -1531,4 +1531,3 @@ if __name__ == "__main__":
     if not TOKEN:
         raise ValueError("DISCORD_TOKEN not set. Add it to your .env or environment variables.")
     bot.run(TOKEN)
- 

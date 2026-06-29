@@ -257,9 +257,11 @@ def _is_soundcloud(url: str) -> bool:
 def _has_valid_stream(url: str) -> bool:
     if not url:
         return False
+    # soundcloud.com is a PAGE url — NOT a playable stream.
+    # Only sndcdn.com / scdn.co are actual SoundCloud CDN audio streams.
     return any(k in url for k in (
         "googlevideo.com", "googleusercontent.com",
-        "sndcdn.com", "scdn.co", "soundcloud.com",
+        "sndcdn.com", "scdn.co",
         ".mp3", ".m4a", ".webm", ".opus",
     ))
 
@@ -299,11 +301,11 @@ def _yt_opts(flat: bool = False) -> dict:
         "ignoreerrors":       False,
         "nocheckcertificate": True,
         "geo_bypass":         True,
-        # web_embedded = acts as embedded player, no bot-check on server IPs
-        # tv_embedded  = HLS-only fallback, also no bot-check
+        # Try all embedded/TV clients — none require cookies or PO tokens
+        # on server/datacenter IPs. web_embedded is most reliable.
         "extractor_args": {
             "youtube": {
-                "player_client": ["web_embedded", "tv_embedded"],
+                "player_client": ["web_embedded", "tv_embedded", "mweb"],
             }
         },
     }
@@ -322,15 +324,22 @@ async def _run(fn):
 async def search_songs(query: str) -> list[dict]:
     """
     Search for any song. Kurdish, Arabic, English — all work.
-    SoundCloud is tried first (no bot detection, huge library).
-    YouTube (web_embedded) is the fallback.
+
+    Strategy:
+      1. SoundCloud FULL extraction (scsearch5) — gets real stream URLs,
+         no bot detection, huge Kurdish/Arabic/Persian/English library.
+      2. YouTube (web_embedded + tv_embedded + mweb) as fallback.
     """
-    # 1. SoundCloud
+    # 1. SoundCloud — full extraction (NOT flat) so we get real audio URLs
     try:
         def _sc():
-            with yt_dlp.YoutubeDL(_sc_opts(flat=True)) as ydl:
-                info = ydl.extract_info(f"scsearch10:{query}", download=False)
-                return [e for e in (info.get("entries") or []) if e] if info else []
+            # scsearch5 with full extraction → entries contain real stream URLs
+            with yt_dlp.YoutubeDL(_sc_opts()) as ydl:
+                info = ydl.extract_info(f"scsearch5:{query}", download=False)
+                if not info:
+                    return []
+                entries = info.get("entries") or []
+                return [e for e in entries if e and e.get("url")]
         results = await _run(_sc)
         if results:
             print(f"[Veltra] SoundCloud: {len(results)} results for '{query}'")
@@ -340,12 +349,12 @@ async def search_songs(query: str) -> list[dict]:
     except Exception as e:
         print(f"[Veltra] SC search failed: {e}")
 
-    # 2. YouTube fallback (web_embedded — no cookies needed on servers)
-    print(f"[Veltra] Trying YouTube (web_embedded) for '{query}'")
+    # 2. YouTube fallback (web_embedded — works on most server IPs)
+    print(f"[Veltra] Trying YouTube for '{query}'")
     try:
         def _yt():
-            with yt_dlp.YoutubeDL({**_yt_opts(flat=True), "noplaylist": True}) as ydl:
-                info = ydl.extract_info(f"ytsearch10:{query}", download=False)
+            with yt_dlp.YoutubeDL({**_yt_opts(), "noplaylist": True}) as ydl:
+                info = ydl.extract_info(f"ytsearch5:{query}", download=False)
                 return [e for e in (info.get("entries") or []) if e] if info else []
         results = await _run(_yt)
         if results:
@@ -358,14 +367,18 @@ async def search_songs(query: str) -> list[dict]:
 
     raise RuntimeError(
         f"No results found for **{query}**.\n"
-        "Try a different search term, or paste a direct SoundCloud/YouTube URL."
+        "Try a different search term or paste a direct SoundCloud/YouTube URL."
     )
 
 
 # ──────────────────────────────────────────────────────
 #  RESOLVE  —  get full stream URL for a single track
 # ──────────────────────────────────────────────────────
-async def resolve_url(url: str, source: str = "auto") -> dict:
+async def resolve_url(url: str, source: str = "auto", _title: str = "") -> dict:
+    """
+    Resolve a URL (or title) to a full info dict with a playable stream URL.
+    Falls back to SoundCloud title-search when YouTube is blocked.
+    """
     is_sc = _is_soundcloud(url) or source == "soundcloud"
 
     if is_sc:
@@ -374,7 +387,7 @@ async def resolve_url(url: str, source: str = "auto") -> dict:
                 return ydl.extract_info(url, download=False)
         try:
             data = await _run(_sc_r)
-            if data:
+            if data and data.get("url"):
                 data["_source"] = "soundcloud"
                 return data
         except Exception as e:
@@ -382,19 +395,36 @@ async def resolve_url(url: str, source: str = "auto") -> dict:
                 raise RuntimeError(f"Track is DRM-protected: {e}")
             raise
 
-    # YouTube — web_embedded (no cookies needed on servers)
+    # YouTube — web_embedded + tv_embedded + mweb
     def _yt_r():
         with yt_dlp.YoutubeDL({**_yt_opts(), "noplaylist": True}) as ydl:
             return ydl.extract_info(url, download=False)
     try:
         data = await _run(_yt_r)
-        if data:
+        if data and data.get("url"):
             data["_source"] = "youtube"
             return data
     except Exception as e:
         if _is_bot_blocked(e):
+            # YouTube blocked — try SoundCloud search by title as last resort
+            title = _title or url
+            print(f"[Veltra] YouTube blocked for resolve, trying SC search: '{title}'")
+            try:
+                def _sc_fallback():
+                    with yt_dlp.YoutubeDL(_sc_opts()) as ydl:
+                        info = ydl.extract_info(f"scsearch1:{title}", download=False)
+                        entries = info.get("entries") or [] if info else []
+                        return entries[0] if entries else None
+                fb = await _run(_sc_fallback)
+                if fb and fb.get("url"):
+                    fb["_source"] = "soundcloud"
+                    print(f"[Veltra] SC fallback found: {fb.get('title')}")
+                    return fb
+            except Exception as fb_e:
+                print(f"[Veltra] SC fallback failed: {fb_e}")
             raise RuntimeError(
-                "YouTube blocked this. Try a SoundCloud link or different search."
+                "YouTube is blocked on this server and SoundCloud couldn't find the song.\n"
+                "Try searching with different keywords or paste a SoundCloud link directly."
             )
         raise
 
@@ -497,11 +527,14 @@ async def play_next(guild_id: int, channel: discord.abc.Messageable, vc: discord
 
     if not _has_valid_stream(song.stream_url):
         try:
-            data            = await resolve_url(song.url, source=song.source)
+            data            = await resolve_url(song.url, source=song.source, _title=song.title)
             song.stream_url = data.get("url", "")
             song.thumbnail  = song.thumbnail or data.get("thumbnail", "")
             song.duration   = song.duration   or data.get("duration", 0)
             song.uploader   = song.uploader   or data.get("uploader") or data.get("channel", "Unknown")
+            # update source if SC fallback was used
+            if data.get("_source"):
+                song.source = data["_source"]
         except Exception as e:
             await channel.send(embed=discord.Embed(
                 color=C_RED,
@@ -873,13 +906,14 @@ async def play(ctx: commands.Context, *, query: str):
             results = await search_songs(query)
             if not results:
                 return await msg.edit(embed=err("No results found!"))
-            data = results[0]
-            ref  = data.get("webpage_url") or data.get("url") or ""
-            src  = data.get("_source", "unknown")
+            data  = results[0]
+            ref   = data.get("webpage_url") or data.get("url") or ""
+            src   = data.get("_source", "unknown")
+            title = data.get("title", query)
             if _has_valid_stream(data.get("url", "")):
                 full = data
             elif ref:
-                full = await resolve_url(ref, source=src)
+                full = await resolve_url(ref, source=src, _title=title)
             else:
                 return await msg.edit(embed=err("Could not resolve stream for that song."))
             song = Song(full, ctx.author)
@@ -958,9 +992,10 @@ async def search(ctx: commands.Context, *, query: str):
     data   = results[idx]
     ref    = data.get("webpage_url") or data.get("url") or ""
     src    = data.get("_source", "unknown")
+    title  = data.get("title", "")
 
     try:
-        full = data if _has_valid_stream(data.get("url", "")) else await resolve_url(ref, source=src)
+        full = data if _has_valid_stream(data.get("url", "")) else await resolve_url(ref, source=src, _title=title)
     except Exception as ex:
         return await msg.edit(embed=err(str(ex)))
 

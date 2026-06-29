@@ -2,4 +2,4 @@
 NIXPACKS_PYTHON_VERSION = "3.11"
 
 [phases.setup]
-nixPkgs = ["ffmpeg", "libsodium"]
+nixPkgs = ["python311", "ffmpeg", "libsodium"]

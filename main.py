@@ -1531,3 +1531,4 @@ if __name__ == "__main__":
     if not TOKEN:
         raise ValueError("DISCORD_TOKEN not set. Add it to your .env or environment variables.")
     bot.run(TOKEN)
+ 

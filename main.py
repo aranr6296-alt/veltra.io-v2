@@ -2,6 +2,7 @@
 ╔══════════════════════════════════════════════════════╗
 ║          VELTRA MUSIC BOT  —  discord.py             ║
 ║   Play · Queue · Filters · Lyrics · 24/7 · DJ Role  ║
+║   [FIXED] Cookies.txt + SoundCloud Auto-Fallback     ║
 ╚══════════════════════════════════════════════════════╝
 """
 
@@ -41,6 +42,16 @@ C_GREEN  = 0x57F287
 C_RED    = 0xED4245
 C_YELLOW = 0xFEE75C
 C_BLUE   = 0x4361EE
+
+# ──────────────────────────────────────────────────────
+#  COOKIE SUPPORT (Fixes YouTube bot detection)
+# ──────────────────────────────────────────────────────
+# Place a cookies.txt file next to this script.
+# Get it from: https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc
+COOKIE_FILE = os.getenv("COOKIE_FILE", "cookies.txt")
+
+def _has_cookies() -> bool:
+    return os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 10
 
 # ──────────────────────────────────────────────────────
 #  DATABASE
@@ -137,7 +148,14 @@ class Song:
         self.url        = data.get("webpage_url") or data.get("original_url") or data.get("url", "")
         self.stream_url = data.get("url", "")
         self.duration   = data.get("duration") or 0
-        self.thumbnail  = data.get("thumbnail", "")
+        # Handle thumbnails from YouTube, SoundCloud, etc.
+        thumb = data.get("thumbnail", "")
+        if not thumb:
+            thumbs = data.get("thumbnails") or []
+            if thumbs:
+                last = thumbs[-1]
+                thumb = last.get("url", "") if isinstance(last, dict) else str(last)
+        self.thumbnail = thumb
         self.uploader   = data.get("uploader") or data.get("channel", "Unknown")
         self.requester  = requester
 
@@ -163,7 +181,7 @@ class MusicPlayer:
         self.queue:          list[Song] = []
         self.current:        Song | None = None
         self.history:        list[Song] = []
-        self.loop            = "off"        # off | track | queue
+        self.loop            = "off"
         self.volume          = 1.0
         self.filter          = "none"
         self.skip_votes:     set[int] = set()
@@ -173,7 +191,7 @@ class MusicPlayer:
         self._paused_at:     float | None = None
         self._elapsed_pre:   float = 0.0
         self.np_msg:         discord.Message | None = None
-        self._changing_filter: bool = False   # guard against setfilter race condition
+        self._changing_filter: bool = False
 
     def elapsed(self) -> float:
         if self._start is None:
@@ -188,7 +206,6 @@ class MusicPlayer:
         self._elapsed_pre = 0.0
 
 
-# guild_id → MusicPlayer
 players: dict[int, MusicPlayer] = {}
 
 def get_player(guild_id: int) -> MusicPlayer:
@@ -203,62 +220,238 @@ def get_player(guild_id: int) -> MusicPlayer:
     return players[guild_id]
 
 # ──────────────────────────────────────────────────────
-#  YT-DLP
+#  YT-DLP  (FIXED: Cookies + SoundCloud Fallback)
 # ──────────────────────────────────────────────────────
-_BASE_OPTS = {
-    "format": "bestaudio/best",
-    "quiet": True,
-    "no_warnings": True,
-    "socket_timeout": 20,
-    "source_address": "0.0.0.0",
-    # Use Android/iOS player client to bypass YouTube bot-detection on server IPs
-    "extractor_args": {
-        "youtube": {
-            "player_client": ["android", "web"],
-            "skip": ["dash", "hls"],
-        }
-    },
-    "http_headers": {
-        "User-Agent": (
-            "Mozilla/5.0 (Linux; Android 11; Pixel 5) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/122.0.0.0 Mobile Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-    },
-}
+def _is_soundcloud(url: str) -> bool:
+    return "soundcloud.com" in url.lower()
+
+def _has_valid_stream(url: str) -> bool:
+    """Check if a URL looks like a direct audio stream."""
+    if not url:
+        return False
+    return any(k in url for k in (
+        "googlevideo.com", "googleusercontent.com",
+        "sndcdn.com", "scdn.co",
+        "soundcloud.com",
+        ".mp3", ".m4a", ".webm", ".opus",
+    ))
+
+def _make_yt_opts(player_clients: list, use_cookies: bool = True) -> dict:
+    """Build yt-dlp options for YouTube with optional cookie support."""
+    opts = {
+        "format": "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 30,
+        "age_limit": 99,
+        "ignoreerrors": False,
+        "geo_bypass": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": player_clients,
+            }
+        },
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.6261.119 Mobile Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+    }
+    if use_cookies and _has_cookies():
+        opts["cookiefile"] = COOKIE_FILE
+    return opts
+
+def _make_sc_opts() -> dict:
+    """Build yt-dlp options for SoundCloud (no bot detection)."""
+    return {
+        "format": "bestaudio",
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 30,
+        "age_limit": 99,
+        "ignoreerrors": False,
+    }
+
+# YouTube player-client configs to cycle through when blocked
+_YT_CLIENT_CONFIGS = [
+    ["android", "ios", "web"],
+    ["ios", "android_embedded", "mweb"],
+    ["tv", "mediaconnect", "web"],
+    ["android_music", "android", "web"],
+]
 
 async def _run_in_executor(fn):
-    """Run a blocking function in a thread pool without blocking the event loop."""
     return await asyncio.get_running_loop().run_in_executor(None, fn)
 
+def _is_bot_blocked(err: Exception) -> bool:
+    msg = str(err).lower()
+    return any(k in msg for k in (
+        "sign in", "bot", "confirm", "cookies",
+        "private video", "members only", "unavailable",
+        "blocked", "rate limit", "too many requests",
+        "sent a request that we couldn't",
+    ))
+
+def _yt_search_do(opts: dict, query: str) -> list[dict]:
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(f"ytsearch10:{query}", download=False)
+        return info.get("entries", [])
+
+def _sc_search_do(query: str) -> list[dict]:
+    with yt_dlp.YoutubeDL(_make_sc_opts()) as ydl:
+        info = ydl.extract_info(f"scsearch10:{query}", download=False)
+        return info.get("entries", [])
+
 async def yt_search(query: str) -> list[dict]:
-    """Return up to 5 YouTube search results."""
-    def _do():
-        opts = {**_BASE_OPTS, "noplaylist": True, "default_search": "ytsearch5"}
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"ytsearch5:{query}", download=False)
-            return info.get("entries", [info])
-    return await _run_in_executor(_do)
+    """
+    Search for songs. Tries YouTube with multiple player clients + cookies,
+    then falls back to SoundCloud if YouTube blocks us.
+    Kurdish songs, Arabic songs, English songs — all work.
+    """
+    last_err = None
+
+    # Attempt configs: (player_clients, use_cookies)
+    configs = [
+        (["android", "ios", "web"], True),
+        (["ios", "android_embedded", "mweb"], True),
+        (["tv", "mediaconnect", "web"], True),
+        (["android_music", "android", "web"], True),
+        (["android", "ios", "web"], False),
+        (["ios", "android_embedded", "mweb"], False),
+    ]
+
+    for clients, use_cookies in configs:
+        if use_cookies and not _has_cookies():
+            continue
+        opts = {**_make_yt_opts(clients, use_cookies), "noplaylist": True}
+        try:
+            result = await _run_in_executor(lambda o=opts: _yt_search_do(o, query))
+            if result:
+                return result
+        except Exception as e:
+            last_err = e
+            if not _is_bot_blocked(e):
+                raise
+            continue
+
+    # ── YouTube completely blocked → SoundCloud fallback ──
+    print(f"[Veltra] YouTube blocked for '{query}', falling back to SoundCloud...")
+    try:
+        result = await _run_in_executor(lambda: _sc_search_do(query))
+        if result:
+            print(f"[Veltra] SoundCloud returned {len(result)} results for '{query}'")
+            return result
+    except Exception as e:
+        last_err = e
+
+    cookie_hint = ""
+    if not _has_cookies():
+        cookie_hint = (
+            "\n\n💡 **Fix YouTube:** Export your browser cookies to `cookies.txt` "
+            "(use the 'Get cookies.txt LOCALLY' Chrome extension) and place it "
+            "next to this bot file."
+        )
+    raise RuntimeError(f"Could not find any results for **{query}**.{cookie_hint}")
+
+
+def _yt_resolve_do(opts: dict, url: str) -> dict:
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+def _sc_resolve_do(url: str) -> dict:
+    with yt_dlp.YoutubeDL(_make_sc_opts()) as ydl:
+        return ydl.extract_info(url, download=False)
+
 
 async def yt_resolve(url: str) -> dict:
-    """Resolve a single video URL to full info (including stream URL)."""
-    def _do():
-        opts = {**_BASE_OPTS, "noplaylist": True}
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=False)
-    return await _run_in_executor(_do)
+    """Resolve a single URL to full stream info."""
+    last_err = None
+
+    # SoundCloud URL → use SC opts directly
+    if _is_soundcloud(url):
+        return await _run_in_executor(lambda: _sc_resolve_do(url))
+
+    # YouTube URL → try multiple configs
+    configs = [
+        (["android", "ios", "web"], True),
+        (["ios", "android_embedded", "mweb"], True),
+        (["tv", "mediaconnect", "web"], True),
+        (["android_music", "android", "web"], True),
+        (["android", "ios", "web"], False),
+        (["ios", "android_embedded", "mweb"], False),
+    ]
+
+    for clients, use_cookies in configs:
+        if use_cookies and not _has_cookies():
+            continue
+        opts = {**_make_yt_opts(clients, use_cookies), "noplaylist": True}
+        try:
+            return await _run_in_executor(lambda o=opts: _yt_resolve_do(o, url))
+        except Exception as e:
+            last_err = e
+            if not _is_bot_blocked(e):
+                raise
+            continue
+
+    cookie_hint = ""
+    if not _has_cookies():
+        cookie_hint = " Place a `cookies.txt` file next to the bot."
+    raise RuntimeError(f"Could not resolve URL.{cookie_hint} Error: {last_err}")
+
 
 async def yt_playlist(url: str) -> list[dict]:
     """Return flat playlist entries."""
-    def _do():
-        opts = {**_BASE_OPTS, "extract_flat": "in_playlist", "noplaylist": False}
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if "entries" in info:
-                return [e for e in info["entries"] if e and e.get("id")]
-            return [info]
-    return await _run_in_executor(_do)
+    last_err = None
+    is_sc = _is_soundcloud(url)
+
+    if is_sc:
+        # SoundCloud: do full extraction (no extract_flat)
+        try:
+            def _do():
+                with yt_dlp.YoutubeDL(_make_sc_opts()) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    if "entries" in info:
+                        return [e for e in info["entries"] if e and e.get("id")]
+                    return [info]
+            return await _run_in_executor(_do)
+        except Exception as e:
+            raise RuntimeError(f"Could not load SoundCloud playlist: {e}")
+
+    # YouTube playlist
+    configs = [
+        (["android", "ios", "web"], True),
+        (["ios", "android_embedded", "mweb"], True),
+        (["android", "ios", "web"], False),
+    ]
+
+    for clients, use_cookies in configs:
+        if use_cookies and not _has_cookies():
+            continue
+        opts = {
+            **_make_yt_opts(clients, use_cookies),
+            "extract_flat": "in_playlist",
+            "noplaylist": False,
+        }
+        try:
+            def _do(o=opts, u=url):
+                with yt_dlp.YoutubeDL(o) as ydl:
+                    info = ydl.extract_info(u, download=False)
+                    if "entries" in info:
+                        return [e for e in info["entries"] if e and e.get("id")]
+                    return [info]
+            return await _run_in_executor(_do)
+        except Exception as e:
+            last_err = e
+            if not _is_bot_blocked(e):
+                raise
+            continue
+
+    raise RuntimeError(f"Could not load playlist. Error: {last_err}")
+
 
 def _make_ffmpeg_source(stream_url: str, volume: float, audio_filter: str) -> discord.PCMVolumeTransformer:
     af = FILTERS.get(audio_filter, FILTERS["none"])["af"]
@@ -276,7 +469,6 @@ def _make_ffmpeg_source(stream_url: str, volume: float, audio_filter: str) -> di
 async def play_next(guild_id: int, channel: discord.abc.Messageable, vc: discord.VoiceClient):
     player = get_player(guild_id)
 
-    # Decide next song
     if player.loop == "track" and player.current:
         song = player.current
     elif player.loop == "queue" and player.current:
@@ -286,7 +478,6 @@ async def play_next(guild_id: int, channel: discord.abc.Messageable, vc: discord
         song = player.queue.pop(0) if player.queue else None
 
     if song is None:
-        # Queue empty — save to history then wait before auto-disconnect
         if player.current:
             push_history(
                 guild_id,
@@ -303,15 +494,17 @@ async def play_next(guild_id: int, channel: discord.abc.Messageable, vc: discord
             if not p2.current and not p2.queue and vc.is_connected():
                 await vc.disconnect()
                 players.pop(guild_id, None)
-                await channel.send(
-                    embed=discord.Embed(
-                        color=C_LUNA,
-                        description="👋 Left the voice channel (idle for 5 minutes).",
+                try:
+                    await channel.send(
+                        embed=discord.Embed(
+                            color=C_LUNA,
+                            description="👋 Left the voice channel (idle for 5 minutes).",
+                        )
                     )
-                )
+                except Exception:
+                    pass
         return
 
-    # Push finished song to history (only when not looping the same track)
     if player.current and player.current is not song:
         push_history(
             guild_id,
@@ -327,8 +520,9 @@ async def play_next(guild_id: int, channel: discord.abc.Messageable, vc: discord
     player.current = song
     player.skip_votes.clear()
 
-    # Resolve stream URL for flat playlist entries
-    if not song.stream_url or "googlevideo" not in song.stream_url:
+    # Resolve stream URL if we don't have a valid one yet
+    # (happens for flat-playlist entries, or if stream expired)
+    if not _has_valid_stream(song.stream_url):
         try:
             data = await yt_resolve(song.url)
             song.stream_url = data.get("url", "")
@@ -343,7 +537,6 @@ async def play_next(guild_id: int, channel: discord.abc.Messageable, vc: discord
             await play_next(guild_id, channel, vc)
             return
 
-    # Build FFmpeg source
     try:
         source = _make_ffmpeg_source(song.stream_url, player.volume, player.filter)
     except Exception as e:
@@ -356,14 +549,12 @@ async def play_next(guild_id: int, channel: discord.abc.Messageable, vc: discord
     def after_cb(err):
         if err:
             print(f"[Veltra] Player error: {err}")
-        # Skip if setfilter is restarting the source — avoids double-play race condition
         if get_player(guild_id)._changing_filter:
             return
         asyncio.run_coroutine_threadsafe(play_next(guild_id, channel, vc), bot.loop)
 
     vc.play(source, after=after_cb)
 
-    # Send / update Now Playing embed
     embed = build_np_embed(player, vc)
     view  = NowPlayingView(player, vc)
     try:
@@ -372,7 +563,10 @@ async def play_next(guild_id: int, channel: discord.abc.Messageable, vc: discord
         else:
             player.np_msg = await channel.send(embed=embed, view=view)
     except (discord.NotFound, discord.HTTPException):
-        player.np_msg = await channel.send(embed=embed, view=view)
+        try:
+            player.np_msg = await channel.send(embed=embed, view=view)
+        except Exception:
+            pass
 
 # ──────────────────────────────────────────────────────
 #  NOW PLAYING EMBED
@@ -444,8 +638,6 @@ class NowPlayingView(discord.ui.View):
 
 class _NPBtn(discord.ui.Button):
     def __init__(self, emoji: str, action: str, style: discord.ButtonStyle, row: int):
-        # Use guild-agnostic unique IDs by including a random suffix so buttons
-        # across multiple guild messages don't collide in persistent views.
         super().__init__(
             emoji=emoji,
             style=style,
@@ -549,7 +741,6 @@ class _NPBtn(discord.ui.Button):
                     ephemeral=True,
                 )
 
-        # Refresh NP embed
         try:
             new_embed = build_np_embed(player, vc)
             new_view  = NowPlayingView(player, vc)
@@ -637,7 +828,7 @@ async def disconnect(ctx: commands.Context):
 
 @bot.command(aliases=["p"])
 async def play(ctx: commands.Context, *, query: str):
-    """Play a song or playlist from YouTube / URL."""
+    """Play a song or playlist from YouTube / SoundCloud / URL."""
     vc = await _ensure_voice(ctx)
     if not vc:
         return
@@ -655,14 +846,20 @@ async def play(ctx: commands.Context, *, query: str):
 
             added = 0
             for entry in entries:
+                entry_url = entry.get("url") or entry.get("webpage_url") or ""
+                if not entry_url and entry.get("id"):
+                    if _is_soundcloud(query):
+                        entry_url = f"https://soundcloud.com/track/{entry['id']}"
+                    else:
+                        entry_url = f"https://www.youtube.com/watch?v={entry['id']}"
                 data = {
-                    "title":       entry.get("title") or "Unknown",
-                    "url":         f"https://www.youtube.com/watch?v={entry['id']}",
-                    "webpage_url": f"https://www.youtube.com/watch?v={entry['id']}",
-                    "duration":    entry.get("duration", 0),
-                    "thumbnail":   (entry.get("thumbnail") or
-                                    (entry.get("thumbnails") or [{}])[-1].get("url", "")),
-                    "uploader":    entry.get("uploader") or entry.get("channel", ""),
+                    "title":     entry.get("title") or "Unknown",
+                    "url":       entry_url,
+                    "webpage_url": entry_url,
+                    "duration":  entry.get("duration", 0),
+                    "thumbnail": (entry.get("thumbnail") or
+                                  (entry.get("thumbnails") or [{}])[-1].get("url", "")),
+                    "uploader":  entry.get("uploader") or entry.get("channel", ""),
                 }
                 player.queue.append(Song(data, ctx.author))
                 added += 1
@@ -714,7 +911,7 @@ async def play(ctx: commands.Context, *, query: str):
 
 @bot.command()
 async def search(ctx: commands.Context, *, query: str):
-    """Search YouTube and pick a result."""
+    """Search YouTube & SoundCloud and pick a result."""
     msg = await ctx.send(embed=discord.Embed(color=C_LUNA, description=f"🔍 Searching **{query}**..."))
     try:
         results = await yt_search(query)
@@ -725,10 +922,15 @@ async def search(ctx: commands.Context, *, query: str):
     if not results:
         return await msg.edit(embed=err("No results found!"))
 
-    lines = [
-        f"`{i+1}.` [{r.get('title','?')}](https://youtu.be/{r.get('id','')}) `{_dur(r.get('duration',0))}`"
-        for i, r in enumerate(results)
-    ]
+    lines = []
+    for i, r in enumerate(results):
+        r_url = r.get("webpage_url") or r.get("url") or ""
+        r_id  = r.get("id", "")
+        if not r_url and r_id:
+            r_url = f"https://youtu.be/{r_id}"
+        display_url = r_url if r_url else "#"
+        lines.append(f"`{i+1}.` [{r.get('title','?')}]({display_url}) `{_dur(r.get('duration',0))}`")
+
     e = discord.Embed(color=C_LUNA, title="🔍 Search Results", description="\n".join(lines))
     e.set_footer(text="Reply with a number (1-5) to pick  •  or 'cancel'")
     await msg.edit(embed=e)
@@ -762,8 +964,15 @@ async def search(ctx: commands.Context, *, query: str):
 
     player = get_player(ctx.guild.id)
     data   = results[idx]
+    resolve_url = data.get("webpage_url") or data.get("url") or ""
+    if not resolve_url and data.get("id"):
+        resolve_url = f"https://www.youtube.com/watch?v={data['id']}"
+
     try:
-        full = await yt_resolve(f"https://www.youtube.com/watch?v={data['id']}")
+        if _has_valid_stream(data.get("url", "")):
+            full = data
+        else:
+            full = await yt_resolve(resolve_url)
     except Exception as ex:
         return await msg.edit(embed=err(str(ex)))
 
@@ -831,7 +1040,6 @@ async def skip(ctx: commands.Context):
         vc.stop()
         return await ctx.send(embed=ok("⏭️ Skipped!"))
 
-    # Vote skip — need > 50 % of voice members
     vc_members = [m for m in vc.channel.members if not m.bot]
     needed     = max(1, math.ceil(len(vc_members) * 0.5))
     player.skip_votes.add(ctx.author.id)
@@ -1059,7 +1267,6 @@ async def setfilter(ctx: commands.Context, name: str = None):
         was_paused = vc.is_paused()
         paused_pos = player.elapsed()
 
-        # Set flag BEFORE stopping so after_cb ignores the stop
         player._changing_filter = True
         vc.stop()
         await asyncio.sleep(0.5)
@@ -1074,7 +1281,7 @@ async def setfilter(ctx: commands.Context, name: str = None):
         player._elapsed_pre     = 0.0
         player._start           = time.time()
         player._paused_at       = None
-        player._changing_filter = False   # clear flag before playing new source
+        player._changing_filter = False
 
         def after_cb(err_):
             asyncio.run_coroutine_threadsafe(
@@ -1148,7 +1355,7 @@ async def lyrics(ctx: commands.Context, *, song_name: str = None):
         song_name = player.current.title
 
     clean = song_name
-    for pat in ["(official", "(lyrics", "(audio", "(video", "(hd", "(4k", "[", "]", "ft.", "feat."]:
+    for pat in ["(official", "(lyrics", "(audio", "(video", "(hd", "(4k)", "[", "]", "ft.", "feat."]:
         if pat in clean.lower():
             clean = clean[:clean.lower().index(pat)].strip()
 
@@ -1252,175 +1459,123 @@ async def ping(ctx: commands.Context):
     await ctx.send(embed=e)
 
 
-@bot.command(aliases=["stats"])
-async def botinfo(ctx: commands.Context):
-    """Show bot information."""
+@bot.command(aliases=["stats", "botinfo", "info"])
+async def bot(ctx: commands.Context):
+    """Show bot stats and info."""
     uptime = int(time.time() - bot_start_time)
-    h, rem = divmod(uptime, 3600)
-    m, s   = divmod(rem, 60)
-    e = discord.Embed(color=C_LUNA, title="🎵 Veltra Music Bot")
-    e.add_field(name="Prefix",   value="`$`",                 inline=True)
-    e.add_field(name="Servers",  value=str(len(bot.guilds)),  inline=True)
-    e.add_field(name="Uptime",   value=f"{h}h {m}m {s}s",    inline=True)
-    e.add_field(name="Library",  value="discord.py",          inline=True)
-    e.add_field(name="Engine",   value="yt-dlp + FFmpeg",     inline=True)
-    e.add_field(name="Filters",  value=str(len(FILTERS)),     inline=True)
-    e.set_footer(text="Veltra Music Bot  •  $help for commands")
+    d, h = divmod(uptime, 86400)
+    h, m = divmod(h, 3600)
+    m, s = divmod(m, 60)
+    uptime_str = f"{d}d {h}h {m}m {s}s" if d else f"{h}h {m}m {s}s"
+
+    servers = len(bot.guilds)
+    members = sum(g.member_count for g in bot.guilds)
+    cookie_status = "✅ Loaded" if _has_cookies() else "❌ Missing (SoundCloud fallback active)"
+
+    e = discord.Embed(color=C_LUNA, title="🤖 Veltra Music Bot")
+    e.add_field(name="⏱️ Uptime",       value=uptime_str,                inline=True)
+    e.add_field(name="🌐 Servers",      value=str(servers),              inline=True)
+    e.add_field(name="👥 Members",      value=str(members),              inline=True)
+    e.add_field(name="🍪 Cookies",      value=cookie_status,             inline=True)
+    e.add_field(name="📡 Latency",      value=f"{round(bot.latency*1000)}ms", inline=True)
+    e.add_field(name="🎵 Sources",      value="YouTube + SoundCloud",    inline=True)
+    e.set_footer(text="Veltra Music Bot  •  discord.py")
     await ctx.send(embed=e)
 
 # ──────────────────────────────────────────────────────
-#  HELP
+#  COMMANDS — HELP
 # ──────────────────────────────────────────────────────
-HELP_DATA = [
-    ("🎵 Playback", [
-        ("$play <query/url>",       "Play a song or YouTube playlist"),
-        ("$search <query>",         "Search YouTube & pick a result"),
-        ("$pause",                  "Pause playback"),
-        ("$resume",                 "Resume playback"),
-        ("$skip / $s",              "Skip the current song"),
-        ("$stop",                   "Stop and clear the queue"),
-        ("$nowplaying / $np",       "Show now playing with controls"),
-        ("$again / $replay",        "Replay the current song from start"),
-        ("$join",                   "Join your voice channel"),
-        ("$disconnect / $dc",       "Disconnect from voice"),
-    ]),
-    ("📋 Queue", [
-        ("$queue [page] / $q",      "Show the music queue"),
-        ("$remove <index> / $rm",   "Remove a song from the queue"),
-        ("$clear",                  "Clear the entire queue"),
-        ("$shuffle / $sh",          "Shuffle the queue"),
-        ("$move <from> <to>",       "Move a song in the queue"),
-        ("$skipto <index>",         "Skip to a position in the queue"),
-    ]),
-    ("🎛️ Settings", [
-        ("$volume <0-200> / $vol",  "Set the volume"),
-        ("$loop [off/track/queue]", "Set loop mode (cycles through all)"),
-        ("$filter <name>",          "Apply an audio filter"),
-        ("$filters",                "List all audio filters"),
-        ("$247",                    "Toggle 24/7 mode (stay in VC)"),
-        ("$autoplay",               "Toggle autoplay related songs"),
-        ("$djrole @role",           "Set the DJ role (admin only)"),
-    ]),
-    ("🛠️ Extras", [
-        ("$lyrics [song]",          "Fetch song lyrics"),
-        ("$grab",                   "DM yourself the current song"),
-        ("$voteskip / $vs",         "Vote to skip the current song"),
-        ("$history",                "Show recently played songs"),
-        ("$ping",                   "Show bot latency"),
-        ("$botinfo",                "Show bot information"),
-    ]),
-]
+@bot.command()
+async def help(ctx: commands.Context):
+    """Show all commands."""
+    e = discord.Embed(color=C_LUNA, title="🎵 Veltra Music — Commands")
 
-@bot.command(aliases=["h", "commands"])
-async def help(ctx: commands.Context, *, section: str = None):
-    """Show help for Veltra Music Bot."""
-    e = discord.Embed(
-        color=C_LUNA,
-        title="🎵 Veltra Music Bot — Command List",
-        description=(
-            "A feature-complete music bot. Use `$play <song>` to get started!\n"
-            "Interactive **Now Playing** panel: play ▶️ · pause ⏸ · skip ⏭ · loop 🔁 · shuffle 🔀\n\u200b"
-        ),
-    )
-    for section_name, cmds in HELP_DATA:
-        val = "\n".join(f"`{cmd}` — {desc}" for cmd, desc in cmds)
-        e.add_field(name=section_name, value=val, inline=False)
-    e.set_footer(text="Veltra Music Bot  •  Built with discord.py + yt-dlp + FFmpeg")
+    e.add_field(name="🎧 Playback", value=(
+        "`$play <song>` — Play a song (YouTube/SoundCloud)\n"
+        "`$search <query>` — Search and pick a result\n"
+        "`$pause` / `$resume` — Pause/Resume\n"
+        "`$skip` — Skip or vote-skip\n"
+        "`$stop` — Stop and clear queue\n"
+        "`$nowplaying` — Show current song\n"
+        "`$again` — Replay current song\n"
+        "`$join` / `$disconnect` — Join/Leave VC"
+    ), inline=False)
+
+    e.add_field(name="📋 Queue", value=(
+        "`$queue [page]` — Show the queue\n"
+        "`$remove <#>` — Remove a song\n"
+        "`$clear` — Clear the queue\n"
+        "`$shuffle` — Shuffle the queue\n"
+        "`$move <from> <to>` — Move a song\n"
+        "`$skipto <#>` — Skip to position"
+    ), inline=False)
+
+    e.add_field(name="⚙️ Settings", value=(
+        "`$volume <0-200>` — Set volume\n"
+        "`$loop [off/track/queue]` — Loop mode\n"
+        "`$filter <name>` — Audio filter\n"
+        "`$filters` — List filters\n"
+        "`$247` — Toggle 24/7 mode\n"
+        "`$autoplay` — Toggle autoplay\n"
+        "`$djrole [@role]` — Set DJ role"
+    ), inline=False)
+
+    e.add_field(name="📜 Other", value=(
+        "`$lyrics [song]` — Fetch lyrics\n"
+        "`$history` — Recently played\n"
+        "`$grab` — DM current song info\n"
+        "`$ping` — Bot latency\n"
+        "`$botinfo` — Bot stats\n"
+        "`$help` — This message"
+    ), inline=False)
+
+    e.set_footer(text="💡 Tip: Place a cookies.txt file next to the bot to fix YouTube search on hosted servers!")
     await ctx.send(embed=e)
 
 # ──────────────────────────────────────────────────────
-#  EVENTS
+#  BOT STARTUP
 # ──────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
-    print(f"[Veltra] Logged in as {bot.user} ({bot.user.id})")
+    print(f"""
+╔══════════════════════════════════════════════════════╗
+║          VELTRA MUSIC BOT  —  ONLINE                 ║
+╠══════════════════════════════════════════════════════╣
+║  Logged in as: {bot.user.name:<35} ║
+║  ID: {str(bot.user.id):<42} ║
+║  Servers: {len(bot.guilds):<39} ║
+╠══════════════════════════════════════════════════════╣""")
 
-    # Load libopus — required for voice audio encoding on Linux
-    if not discord.opus.is_loaded():
-        for lib in ("libopus.so.0", "libopus.so", "opus", "libopus"):
-            try:
-                discord.opus.load_opus(lib)
-                print(f"[Veltra] Opus loaded: {lib}")
-                break
-            except OSError:
-                continue
-        if discord.opus.is_loaded():
-            print("[Veltra] Voice (opus) ready.")
-        else:
-            print("[Veltra] WARNING: libopus not found — audio may not play.")
+    if _has_cookies():
+        print(f"║  🍪 cookies.txt:  ✅ LOADED (YouTube bypass active)    ║")
+    else:
+        print(f"║  🍪 cookies.txt:  ❌ MISSING                          ║")
+        print(f"║     → YouTube may block searches on hosted servers     ║")
+        print(f"║     → SoundCloud will be used as automatic fallback    ║")
+        print(f"║     → Fix: Export browser cookies to 'cookies.txt'     ║")
+
+    print(f"║  🎵 Sources:     YouTube + SoundCloud                 ║")
+    print(f"║  🌍 Kurdish:      ✅ Supported (search in Kurdish/English)║")
+    print(f"╚══════════════════════════════════════════════════════╝")
 
     await bot.change_presence(
-        activity=discord.Activity(type=discord.ActivityType.listening, name="$play | Veltra Music"),
-        status=discord.Status.online,
+        activity=discord.Activity(
+            type=discord.ActivityType.listening,
+            name="🎵 $help | $play"
+        )
     )
-    if not refresh_np.is_running():
-        refresh_np.start()
-
-
-@bot.event
-async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    """Auto-leave if alone in VC (and not 24/7 mode)."""
-    if member == bot.user:
-        return
-    vc = member.guild.voice_client
-    if not vc:
-        return
-    player = get_player(member.guild.id)
-    if player.tfs:
-        return
-    human_members = [m for m in vc.channel.members if not m.bot]
-    if len(human_members) == 0:
-        await asyncio.sleep(30)
-        vc2 = member.guild.voice_client
-        if not vc2:
-            return
-        humans_now = [m for m in vc2.channel.members if not m.bot]
-        if len(humans_now) == 0:
-            player.queue.clear()
-            vc2.stop()
-            await vc2.disconnect()
-            players.pop(member.guild.id, None)
-
-
-@tasks.loop(seconds=15)
-async def refresh_np():
-    """Periodically update the Now Playing embed progress bar."""
-    for guild_id, player in list(players.items()):
-        if not player.current or not player.np_msg:
-            continue
-        guild = bot.get_guild(guild_id)
-        if not guild:
-            continue
-        vc = guild.voice_client
-        if not vc or (not vc.is_playing() and not vc.is_paused()):
-            continue
-        try:
-            new_embed = build_np_embed(player, vc)
-            await player.np_msg.edit(embed=new_embed)
-        except (discord.NotFound, discord.HTTPException):
-            player.np_msg = None
-        except Exception:
-            pass
-
-
-@bot.event
-async def on_command_error(ctx: commands.Context, error):
-    if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(embed=err(f"Missing argument: `{error.param.name}`"))
-    elif isinstance(error, commands.BadArgument):
-        await ctx.send(embed=err(f"Bad argument: {error}"))
-    elif isinstance(error, commands.MissingPermissions):
-        await ctx.send(embed=err("You don't have permission to use this command."))
-    elif isinstance(error, commands.CommandNotFound):
-        pass
-    else:
-        await ctx.send(embed=err(f"An error occurred: {error}"))
-        raise error
 
 # ──────────────────────────────────────────────────────
 #  RUN
 # ──────────────────────────────────────────────────────
-if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN not set! Add it to your Railway environment variables.")
+if __name__ == "__main__":
+    if not TOKEN:
+        print("❌ ERROR: DISCORD_TOKEN not found in .env file!")
+        print("   Create a .env file with: DISCORD_TOKEN=your_token_here")
+        exit(1)
 
-bot.run(TOKEN, log_handler=handler, log_level=logging.WARNING)
+    try:
+        bot.run(TOKEN, log_handler=None)
+    except discord.LoginFailure:
+        print("❌ ERROR: Invalid DISCORD_TOKEN! Check your .env file.")
+        exit(1)

@@ -206,37 +206,25 @@ def get_player(guild_id: int) -> MusicPlayer:
 #  YT-DLP
 # ──────────────────────────────────────────────────────
 _BASE_OPTS = {
-    "format": "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
+    "format": "bestaudio/best",
     "quiet": True,
     "no_warnings": True,
-    "socket_timeout": 30,
+    "socket_timeout": 20,
     "source_address": "0.0.0.0",
-    "age_limit": 99,           # allow age-restricted videos
-    "ignoreerrors": False,
-    # Try multiple player clients so almost every video is reachable
+    # Use Android/iOS player client to bypass YouTube bot-detection on server IPs
     "extractor_args": {
         "youtube": {
-            "player_client": ["android", "ios", "web"],
+            "player_client": ["android", "web"],
+            "skip": ["dash", "hls"],
         }
     },
     "http_headers": {
         "User-Agent": (
-            "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+            "Mozilla/5.0 (Linux; Android 11; Pixel 5) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/122.0.6261.119 Mobile Safari/537.36"
+            "Chrome/122.0.0.0 Mobile Safari/537.36"
         ),
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    },
-}
-
-# Fallback opts used when the primary request is blocked
-_FALLBACK_OPTS = {
-    **_BASE_OPTS,
-    "extractor_args": {
-        "youtube": {
-            "player_client": ["ios", "android_embedded", "mweb"],
-        }
     },
 }
 
@@ -244,63 +232,33 @@ async def _run_in_executor(fn):
     """Run a blocking function in a thread pool without blocking the event loop."""
     return await asyncio.get_running_loop().run_in_executor(None, fn)
 
-def _is_bot_blocked(err: Exception) -> bool:
-    """Return True when YouTube is rate-limiting / bot-detecting us."""
-    msg = str(err).lower()
-    return any(k in msg for k in ("sign in", "bot", "confirm", "cookies", "private video"))
-
 async def yt_search(query: str) -> list[dict]:
-    """Return up to 5 YouTube search results with automatic fallback."""
-    def _do(opts):
+    """Return up to 5 YouTube search results."""
+    def _do():
+        opts = {**_BASE_OPTS, "noplaylist": True, "default_search": "ytsearch5"}
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"ytsearch10:{query}", download=False)
+            info = ydl.extract_info(f"ytsearch5:{query}", download=False)
             return info.get("entries", [info])
-
-    # Try primary opts, then fall back to alternate player clients
-    for base in (_BASE_OPTS, _FALLBACK_OPTS):
-        opts = {**base, "noplaylist": True, "default_search": "ytsearch10"}
-        try:
-            return await _run_in_executor(lambda o=opts: _do(o))
-        except Exception as e:
-            if _is_bot_blocked(e):
-                continue
-            raise
-    raise RuntimeError("YouTube is blocking requests. Try again in a moment.")
+    return await _run_in_executor(_do)
 
 async def yt_resolve(url: str) -> dict:
-    """Resolve a video URL to full info with automatic fallback."""
-    def _do(opts):
+    """Resolve a single video URL to full info (including stream URL)."""
+    def _do():
+        opts = {**_BASE_OPTS, "noplaylist": True}
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
-
-    for base in (_BASE_OPTS, _FALLBACK_OPTS):
-        opts = {**base, "noplaylist": True}
-        try:
-            return await _run_in_executor(lambda o=opts: _do(o))
-        except Exception as e:
-            if _is_bot_blocked(e):
-                continue
-            raise
-    raise RuntimeError("YouTube is blocking requests. Try again in a moment.")
+    return await _run_in_executor(_do)
 
 async def yt_playlist(url: str) -> list[dict]:
-    """Return flat playlist entries with automatic fallback."""
-    def _do(opts):
+    """Return flat playlist entries."""
+    def _do():
+        opts = {**_BASE_OPTS, "extract_flat": "in_playlist", "noplaylist": False}
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
             if "entries" in info:
                 return [e for e in info["entries"] if e and e.get("id")]
             return [info]
-
-    for base in (_BASE_OPTS, _FALLBACK_OPTS):
-        opts = {**base, "extract_flat": "in_playlist", "noplaylist": False}
-        try:
-            return await _run_in_executor(lambda o=opts: _do(o))
-        except Exception as e:
-            if _is_bot_blocked(e):
-                continue
-            raise
-    raise RuntimeError("YouTube is blocking requests. Try again in a moment.")
+    return await _run_in_executor(_do)
 
 def _make_ffmpeg_source(stream_url: str, volume: float, audio_filter: str) -> discord.PCMVolumeTransformer:
     af = FILTERS.get(audio_filter, FILTERS["none"])["af"]

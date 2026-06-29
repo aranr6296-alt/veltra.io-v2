@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════╗
-║          LUNA MUSIC BOT  —  discord.py               ║
+║          VELTRA MUSIC BOT  —  discord.py               ║
 ║   Play · Queue · Filters · Lyrics · 24/7 · DJ Role  ║
 ╚══════════════════════════════════════════════════════╝
 """

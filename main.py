@@ -16,6 +16,7 @@ import random
 import sqlite3
 import aiohttp
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -132,7 +133,7 @@ FILTERS: dict[str, dict] = {
 #  SONG & PLAYER
 # ──────────────────────────────────────────────────────
 class Song:
-    def __init__(self, data: dict, requester: discord.Member):
+    def __init__(self, data: dict, requester: discord.Member, source: str = "soundcloud"):
         self.title      = data.get("title", "Unknown")
         self.url        = data.get("webpage_url") or data.get("original_url") or data.get("url", "")
         self.stream_url = data.get("url", "")      # direct audio URL (may be empty for flat entries)
@@ -140,6 +141,7 @@ class Song:
         self.thumbnail  = data.get("thumbnail", "")
         self.uploader   = data.get("uploader") or data.get("channel", "Unknown")
         self.requester  = requester
+        self.source     = source  # "soundcloud" or "youtube"
 
     @property
     def dur_str(self) -> str:
@@ -148,6 +150,10 @@ class Song:
         m, s = divmod(int(self.duration), 60)
         h, m = divmod(m, 60)
         return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+    @property
+    def source_icon(self) -> str:
+        return "☁️" if self.source == "soundcloud" else "▶️"
 
     def progress_bar(self, elapsed: float, length: int = 13) -> str:
         if not self.duration:
@@ -202,55 +208,162 @@ def get_player(guild_id: int) -> MusicPlayer:
     return players[guild_id]
 
 # ──────────────────────────────────────────────────────
-#  YT-DLP
+#  YT-DLP  —  SoundCloud primary · YouTube web_embedded fallback
+#  SoundCloud: no bot-detection, huge library
+#  YouTube:    web_embedded client bypasses server-IP bot checks
 # ──────────────────────────────────────────────────────
-_BASE_OPTS = {
-    "format": "bestaudio/best",
-    "quiet": True,
-    "no_warnings": True,
-    "socket_timeout": 20,
-    "source_address": "0.0.0.0",
+_executor = ThreadPoolExecutor(max_workers=6)
+
+_SC_BASE = {
+    "format":             "bestaudio[ext=opus]/bestaudio[ext=mp3]/bestaudio[ext=m4a]/bestaudio/best",
+    "noplaylist":         True,
+    "nocheckcertificate": True,
+    "ignoreerrors":       False,
+    "quiet":              True,
+    "no_warnings":        True,
+    "source_address":     "0.0.0.0",
+    "socket_timeout":     20,
 }
 
-async def _run_in_executor(fn):
-    return await asyncio.get_event_loop().run_in_executor(None, fn)
+_YT_BASE = {
+    **_SC_BASE,
+    "extractor_args": {
+        "youtube": {"player_client": ["web_embedded", "tv_embedded"]}
+    },
+    **({"cookiefile": "cookies.txt"} if os.path.exists("cookies.txt") else {}),
+}
 
-async def yt_search(query: str) -> list[dict]:
-    """Return up to 5 search results."""
-    def _do():
-        opts = {**_BASE_OPTS, "noplaylist": True, "default_search": "ytsearch5"}
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"ytsearch5:{query}", download=False)
-            return info.get("entries", [info])
-    return await _run_in_executor(_do)
+_SC_SEARCH_OPTS  = {**_SC_BASE, "extract_flat": True,  "skip_download": True, "noplaylist": False, "ignoreerrors": True}
+_YT_SEARCH_OPTS  = {**_YT_BASE, "extract_flat": True,  "skip_download": True, "noplaylist": False, "ignoreerrors": True}
+_SC_RESOLVE      = {**_SC_BASE, "ignoreerrors": False}
+_YT_RESOLVE      = {**_YT_BASE, "ignoreerrors": False}
+_PL_RESOLVE      = {**_SC_BASE, "noplaylist": False, "ignoreerrors": True}
 
-async def yt_resolve(url: str) -> dict:
-    """Resolve a single video URL to full info (including stream URL)."""
-    def _do():
-        opts = {**_BASE_OPTS, "noplaylist": True}
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=False)
-    return await _run_in_executor(_do)
+FFMPEG_BEFORE = (
+    "-reconnect 1 -reconnect_streamed 1 "
+    "-reconnect_delay_max 5 "
+    "-protocol_whitelist file,http,https,tcp,tls,crypto"
+)
+FFMPEG_OPTS_BASE = "-vn -acodec pcm_s16le -ar 48000 -ac 2"
 
-async def yt_playlist(url: str) -> list[dict]:
-    """Return flat playlist entries (no stream URLs yet)."""
-    def _do():
-        opts = {**_BASE_OPTS, "extract_flat": "in_playlist", "noplaylist": False}
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if "entries" in info:
-                return [e for e in info["entries"] if e and e.get("id")]
-            return [info]
-    return await _run_in_executor(_do)
+def _is_drm(e: Exception) -> bool:
+    msg = str(e).lower()
+    return any(k in msg for k in ("drm", "go+", "protected", "premium"))
+
+def _ytdl_extract(opts: dict, url: str) -> dict | None:
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+async def _run(fn):
+    return await asyncio.get_event_loop().run_in_executor(_executor, fn)
+
+async def _sc_search(query: str, requester: discord.Member) -> Song | None:
+    """Search SoundCloud, skip DRM tracks, return first playable Song."""
+    try:
+        raw = await _run(lambda: _ytdl_extract(_SC_SEARCH_OPTS, f"scsearch5:{query}"))
+    except Exception:
+        return None
+    entries = [e for e in (raw.get("entries") or []) if e] if raw else []
+    for i, entry in enumerate(entries):
+        ref = entry.get("webpage_url") or entry.get("url", "")
+        if not ref:
+            continue
+        try:
+            data = await _run(lambda u=ref: _ytdl_extract(_SC_RESOLVE, u))
+            if data and data.get("url"):
+                print(f"[SC] ✅ {data.get('title','?')[:60]}")
+                return Song(data, requester, source="soundcloud")
+        except Exception as e:
+            if _is_drm(e):
+                print(f"[SC] #{i+1} DRM — skipping")
+                continue
+    return None
+
+async def _yt_search(query: str, requester: discord.Member) -> Song | None:
+    """Search YouTube via web_embedded client (no bot-check on server IPs)."""
+    try:
+        raw = await _run(lambda: _ytdl_extract(_YT_SEARCH_OPTS, f"ytsearch5:{query}"))
+    except Exception:
+        return None
+    entries = [e for e in (raw.get("entries") or []) if e] if raw else []
+    for i, entry in enumerate(entries):
+        ref = entry.get("webpage_url") or entry.get("url", "")
+        if not ref:
+            continue
+        try:
+            data = await _run(lambda u=ref: _ytdl_extract(_YT_RESOLVE, u))
+            if data and data.get("url"):
+                print(f"[YT] ✅ {data.get('title','?')[:60]}")
+                return Song(data, requester, source="youtube")
+        except Exception as e:
+            print(f"[YT] #{i+1} failed: {e}")
+    return None
+
+async def resolve_query(query: str, requester: discord.Member) -> list[Song]:
+    """Resolve a search query or URL → list of Songs."""
+    is_url = query.startswith(("http://", "https://"))
+
+    if is_url:
+        is_sc = "soundcloud.com" in query
+        is_pl = "playlist" in query or "list=" in query or "/sets/" in query
+        opts   = _PL_RESOLVE if is_pl else (_SC_RESOLVE if is_sc else _YT_RESOLVE)
+        source = "soundcloud" if is_sc else "youtube"
+        try:
+            data = await _run(lambda: _ytdl_extract(opts, query))
+        except Exception as e:
+            print(f"[resolve] URL failed: {e}")
+            return []
+        if not data:
+            return []
+        entries = data.get("entries") or [data]
+        songs   = []
+        for e in entries:
+            if not e:
+                continue
+            if not e.get("url") or e.get("_type") == "url":
+                ref = e.get("webpage_url") or e.get("url", "")
+                if not ref:
+                    continue
+                try:
+                    e = await _run(lambda u=ref: _ytdl_extract(
+                        _SC_RESOLVE if is_sc else _YT_RESOLVE, u
+                    ))
+                except Exception as ex:
+                    if _is_drm(ex):
+                        print("[resolve] DRM — skipping")
+                    continue
+            if e and e.get("url"):
+                songs.append(Song(e, requester, source=source))
+        return songs
+
+    # Text search: SoundCloud first, YouTube fallback
+    song = await _sc_search(query, requester)
+    if not song:
+        print(f"[search] SC failed, trying YouTube for: {query[:60]}")
+        song = await _yt_search(query, requester)
+    return [song] if song else []
+
+async def resolve_stream(song: Song) -> str:
+    """Fetch a fresh CDN stream URL right before playing (CDN URLs expire)."""
+    opts = _SC_RESOLVE if song.source == "soundcloud" else _YT_RESOLVE
+    ref  = song.url or song.stream_url
+    data = await _run(lambda: _ytdl_extract(opts, ref))
+    if not data:
+        raise RuntimeError("yt-dlp returned nothing")
+    if "entries" in data:
+        entries = [e for e in (data.get("entries") or []) if e]
+        if not entries:
+            raise RuntimeError("No playable entries")
+        data = entries[0]
+    url = data.get("url", "")
+    if not url:
+        raise RuntimeError("No stream URL — track may be restricted or unavailable")
+    return url
 
 def _make_ffmpeg_source(stream_url: str, volume: float, audio_filter: str) -> discord.PCMVolumeTransformer:
-    af = FILTERS.get(audio_filter, FILTERS["none"])["af"]
-    options = f"-vn{f' -af {af}' if af else ''}"
-    src = discord.FFmpegPCMAudio(
-        stream_url,
-        before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-        options=options,
-    )
+    af      = FILTERS.get(audio_filter, FILTERS["none"])["af"]
+    options = FFMPEG_OPTS_BASE + (f" -af {af}" if af else "")
+    src = discord.FFmpegPCMAudio(stream_url, before_options=FFMPEG_BEFORE, options=options)
     return discord.PCMVolumeTransformer(src, volume=volume)
 
 # ──────────────────────────────────────────────────────
@@ -310,18 +423,15 @@ async def play_next(guild_id: int, channel: discord.abc.Messageable, vc: discord
     player.current = song
     player.skip_votes.clear()
 
-    # Resolve stream URL for flat playlist entries
-    if not song.stream_url or "googlevideo" not in song.stream_url:
-        try:
-            data = await yt_resolve(song.url)
-            song.stream_url = data.get("url", "")
-            song.thumbnail  = song.thumbnail or data.get("thumbnail", "")
-            song.duration   = song.duration   or data.get("duration", 0)
-            song.uploader   = song.uploader   or data.get("uploader") or data.get("channel", "Unknown")
-        except Exception as e:
-            await channel.send(embed=discord.Embed(color=C_RED, description=f"⚠️ Skipping **{song.title}** — couldn't resolve stream: {e}"))
-            asyncio.run_coroutine_threadsafe(play_next(guild_id, channel, vc), bot.loop)
-            return
+    # Always fetch a fresh CDN stream URL right before playing (URLs expire)
+    try:
+        song.stream_url = await resolve_stream(song)
+    except Exception as e:
+        is_drm = _is_drm(e)
+        desc   = "DRM protected — skipping…" if is_drm else str(e)[:140]
+        await channel.send(embed=discord.Embed(color=C_RED, description=f"⚠️ **{song.title[:60]}** — {desc}"))
+        asyncio.run_coroutine_threadsafe(play_next(guild_id, channel, vc), bot.loop)
+        return
 
     # Build source
     try:
@@ -582,74 +692,40 @@ async def disconnect(ctx: commands.Context):
 
 @bot.command(aliases=["p"])
 async def play(ctx: commands.Context, *, query: str):
-    """Play a song or playlist from YouTube / URL."""
+    """Play a song or playlist — SoundCloud first, YouTube fallback."""
     vc = await _ensure_voice(ctx)
     if not vc: return
 
     player = get_player(ctx.guild.id)
-    msg    = await ctx.send(embed=discord.Embed(color=C_LUNA, description=f"🔍 Searching for **{query}**..."))
+    msg    = await ctx.send(embed=discord.Embed(color=C_LUNA, description=f"🔍 Searching **{query}**..."))
 
     try:
-        is_url = query.startswith(("http://", "https://"))
-
-        if is_url and ("list=" in query or "playlist" in query.lower()):
-            # YouTube Playlist
-            entries = await yt_playlist(query)
-            if not entries:
-                return await msg.edit(embed=err("Couldn't find anything in that playlist."))
-
-            # Add flat entries to queue (stream URLs resolved at play time)
-            added = 0
-            for e in entries:
-                data = {
-                    "title": e.get("title") or e.get("ie_key") or "Unknown",
-                    "url":   f"https://www.youtube.com/watch?v={e['id']}",
-                    "webpage_url": f"https://www.youtube.com/watch?v={e['id']}",
-                    "duration": e.get("duration", 0),
-                    "thumbnail": e.get("thumbnail") or e.get("thumbnails", [{}])[-1].get("url",""),
-                    "uploader": e.get("uploader") or e.get("channel",""),
-                }
-                player.queue.append(Song(data, ctx.author))
-                added += 1
-
-            e = discord.Embed(color=C_LUNA, title="📋 Playlist Added!")
-            e.add_field(name="Songs", value=str(added), inline=True)
-            e.add_field(name="Queue length", value=str(len(player.queue)), inline=True)
-            await msg.edit(embed=e)
-
-        elif is_url:
-            # Direct video URL
-            data = await yt_resolve(query)
-            song = Song(data, ctx.author)
-            player.queue.append(song)
-            if vc.is_playing() or vc.is_paused():
-                e = discord.Embed(color=C_LUNA, title="➕ Added to Queue", description=f"**[{song.title}]({song.url})**")
-                e.add_field(name="Duration", value=song.dur_str, inline=True)
-                e.add_field(name="Position", value=f"#{len(player.queue)}", inline=True)
-                if song.thumbnail: e.set_thumbnail(url=song.thumbnail)
-                await msg.edit(embed=e)
-            else:
-                await msg.delete()
-
-        else:
-            # Search query → show top result
-            results = await yt_search(query)
-            if not results:
-                return await msg.edit(embed=err("No results found!"))
-            data = results[0]
-            song = Song(data, ctx.author)
-            player.queue.append(song)
-            if vc.is_playing() or vc.is_paused():
-                e = discord.Embed(color=C_LUNA, title="➕ Added to Queue", description=f"**[{song.title}]({song.url})**")
-                e.add_field(name="Duration", value=song.dur_str, inline=True)
-                e.add_field(name="Position", value=f"#{len(player.queue)}", inline=True)
-                if song.thumbnail: e.set_thumbnail(url=song.thumbnail)
-                await msg.edit(embed=e)
-            else:
-                await msg.delete()
-
+        songs = await resolve_query(query, ctx.author)
     except Exception as ex:
         return await msg.edit(embed=err(f"Error: {ex}"))
+
+    if not songs:
+        return await msg.edit(embed=err("No results found! Try a different search term or URL."))
+
+    for song in songs:
+        player.queue.append(song)
+
+    if len(songs) > 1:
+        e = discord.Embed(color=C_LUNA, title="📋 Playlist Added!")
+        e.add_field(name="Songs added", value=str(len(songs)), inline=True)
+        e.add_field(name="Queue length", value=str(len(player.queue)), inline=True)
+        await msg.edit(embed=e)
+    else:
+        song = songs[0]
+        if vc.is_playing() or vc.is_paused():
+            e = discord.Embed(color=C_LUNA, title="➕ Added to Queue",
+                              description=f"{song.source_icon} **[{song.title}]({song.url})**")
+            e.add_field(name="Duration", value=song.dur_str, inline=True)
+            e.add_field(name="Position",  value=f"#{len(player.queue)}", inline=True)
+            if song.thumbnail: e.set_thumbnail(url=song.thumbnail)
+            await msg.edit(embed=e)
+        else:
+            await msg.delete()
 
     if not vc.is_playing() and not vc.is_paused():
         await play_next(ctx.guild.id, ctx.channel, vc)
@@ -658,19 +734,24 @@ async def play(ctx: commands.Context, *, query: str):
 @bot.command()
 async def search(ctx: commands.Context, *, query: str):
     """Search YouTube and pick a result."""
-    msg = await ctx.send(embed=discord.Embed(color=C_LUNA, description=f"🔍 Searching **{query}**..."))
+    msg = await ctx.send(embed=discord.Embed(color=C_LUNA, description=f"🔍 Searching SoundCloud for **{query}**..."))
+
+    # Flat search — SoundCloud top 5 titles only (fast)
     try:
-        results = await yt_search(query)
+        raw = await _run(lambda: _ytdl_extract(_SC_SEARCH_OPTS, f"scsearch5:{query}"))
     except Exception as ex:
         return await msg.edit(embed=err(str(ex)))
 
-    results = results[:5]
+    results = [e for e in (raw.get("entries") or []) if e][:5] if raw else []
     if not results:
-        return await msg.edit(embed=err("No results found!"))
+        return await msg.edit(embed=err("No results found on SoundCloud!"))
 
-    lines = [f"`{i+1}.` [{r.get('title','?')}](https://youtu.be/{r.get('id','')}) `{_dur(r.get('duration',0))}`" for i, r in enumerate(results)]
-    e = discord.Embed(color=C_LUNA, title="🔍 Search Results", description="\n".join(lines))
-    e.set_footer(text="Reply with a number (1-5) to pick a song  •  or 'cancel'")
+    lines = [
+        f"`{i+1}.` **{r.get('title','?')}** — {r.get('uploader') or r.get('channel','?')} `{_dur(r.get('duration',0))}`"
+        for i, r in enumerate(results)
+    ]
+    e = discord.Embed(color=C_LUNA, title="☁️ SoundCloud Search Results", description="\n".join(lines))
+    e.set_footer(text="Reply with a number (1-5) to pick  •  or 'cancel'")
     await msg.edit(embed=e)
 
     def check(m):
@@ -687,7 +768,7 @@ async def search(ctx: commands.Context, *, query: str):
         pass
 
     if reply.content.lower() == "cancel":
-        return await msg.edit(embed=ok("Cancelled search."))
+        return await msg.edit(embed=ok("Cancelled."))
 
     try:
         idx = int(reply.content) - 1
@@ -700,17 +781,24 @@ async def search(ctx: commands.Context, *, query: str):
     if not vc: return
 
     player = get_player(ctx.guild.id)
-    data   = results[idx]
+    ref = results[idx].get("webpage_url") or results[idx].get("url", "")
+    await msg.edit(embed=discord.Embed(color=C_LUNA, description=f"⏳ Loading **{results[idx].get('title','?')}**..."))
+
     try:
-        full = await yt_resolve(f"https://www.youtube.com/watch?v={data['id']}")
+        data = await _run(lambda u=ref: _ytdl_extract(_SC_RESOLVE, u))
     except Exception as ex:
         return await msg.edit(embed=err(str(ex)))
 
-    song = Song(full, ctx.author)
+    if not data or not data.get("url"):
+        return await msg.edit(embed=err("Couldn't load that track. It may be DRM-protected."))
+
+    song = Song(data, ctx.author, source="soundcloud")
     player.queue.append(song)
 
-    e2 = discord.Embed(color=C_LUNA, title="➕ Added to Queue", description=f"**[{song.title}]({song.url})**")
+    e2 = discord.Embed(color=C_LUNA, title="➕ Added to Queue",
+                       description=f"☁️ **[{song.title}]({song.url})**")
     e2.add_field(name="Duration", value=song.dur_str, inline=True)
+    e2.add_field(name="Position", value=f"#{len(player.queue)}", inline=True)
     if song.thumbnail: e2.set_thumbnail(url=song.thumbnail)
     await msg.edit(embed=e2)
 

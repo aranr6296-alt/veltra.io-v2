@@ -9,12 +9,11 @@ from collections import deque
 import random
 import time
 import json
-import aiohttp
 import urllib.parse
 from dotenv import load_dotenv
 import logging
 import sys
-import hashlib
+import subprocess
 
 # Load environment variables
 load_dotenv()
@@ -28,13 +27,20 @@ TOKEN = os.getenv('DISCORD_TOKEN', 'YOUR_BOT_TOKEN_HERE')
 PREFIX = os.getenv('PREFIX', '$')
 MAX_QUEUE_SIZE = 500
 
-# FFmpeg options
+# Check if ffmpeg is available
+try:
+    subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+    logger.info("✅ FFmpeg is available")
+except:
+    logger.warning("⚠️ FFmpeg not found, using fallback")
+
+# FFmpeg options for Railway
 FFMPEG_OPTIONS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
     'options': '-vn -bufsize 64k -loglevel quiet'
 }
 
-# yt-dlp options
+# yt-dlp options - OPTIMIZED FOR RAILWAY
 YDL_OPTIONS = {
     'format': 'bestaudio/best',
     'postprocessors': [{
@@ -42,7 +48,7 @@ YDL_OPTIONS = {
         'preferredcodec': 'mp3',
         'preferredquality': '128',
     }],
-    'outtmpl': '/tmp/%(title)s.%(ext)s',
+    'outtmpl': '/tmp/audio_%(title)s_%(id)s.%(ext)s',
     'restrictfilenames': True,
     'noplaylist': False,
     'nocheckcertificate': True,
@@ -54,7 +60,8 @@ YDL_OPTIONS = {
     'source_address': '0.0.0.0',
     'socket_timeout': 30,
     'retries': 3,
-    'fragment_retries': 3
+    'fragment_retries': 3,
+    'extract_flat': False
 }
 
 # ============== KURDISH SONG DATABASE ==============
@@ -96,6 +103,13 @@ KURDISH_SONG_DATABASE = {
         'songs': [
             'kurdistan', 'azadî', 'serxwebûn', 'xwezî',
             'keça kurd', 'xortê kurd', 'jin', 'jîyan'
+        ]
+    },
+    'gulan': {
+        'keywords': ['gulan', 'gulan kurdish'],
+        'songs': [
+            'stranek', 'kilamek', 'dengê min', 'awazê min',
+            'dilê min', 'canê min', 'evîna min'
         ]
     },
     'kurmancî': {
@@ -179,8 +193,7 @@ class MusicBot(commands.Bot):
         super().__init__(
             command_prefix=PREFIX,
             intents=intents,
-            help_command=None,
-            application_id=os.getenv('APPLICATION_ID')
+            help_command=None
         )
         
         self.queues = {}
@@ -198,8 +211,11 @@ class MusicBot(commands.Bot):
         logger.info(f"🤖 Bot initialized with {len(self.kurdish_finder.all_kurdish_songs)} Kurdish songs")
 
     async def setup_hook(self):
-        await self.tree.sync()
-        logger.info("✅ Slash commands synced")
+        try:
+            await self.tree.sync()
+            logger.info("✅ Slash commands synced")
+        except Exception as e:
+            logger.error(f"Slash sync error: {e}")
 
     def get_queue(self, guild_id):
         if guild_id not in self.queues:
@@ -267,7 +283,8 @@ class MusicPlayer:
                     'no_warnings': True,
                     'extract_flat': True,
                     'default_search': 'ytsearch',
-                    'max_downloads': limit * 2
+                    'max_downloads': limit * 2,
+                    'socket_timeout': 30
                 }
                 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -284,7 +301,7 @@ class MusicPlayer:
             except Exception as e:
                 logger.warning(f"Search error: {e}")
 
-            # If no results, try with Kurdish
+            # If no results, try with language detection
             if not results:
                 language = self.detect_language(query)
                 if language == 'kurdish':
@@ -294,7 +311,8 @@ class MusicPlayer:
                             'no_warnings': True,
                             'extract_flat': True,
                             'default_search': 'ytsearch',
-                            'max_downloads': limit
+                            'max_downloads': limit,
+                            'socket_timeout': 30
                         }
                         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                             search_results = await asyncio.to_thread(
@@ -384,69 +402,6 @@ class MusicPlayer:
             logger.error(f"Download error: {e}")
             return None
 
-    async def play_song(self, ctx, query):
-        """Main play function"""
-        try:
-            if not ctx.author.voice:
-                await ctx.send("❌ You need to be in a voice channel!")
-                return None
-            
-            voice_channel = ctx.author.voice.channel
-            if ctx.voice_client is None:
-                await voice_channel.connect(timeout=10.0)
-            elif ctx.voice_client.channel != voice_channel:
-                await ctx.voice_client.move_to(voice_channel)
-            
-            # Check if it's a URL
-            is_url = query.startswith(('http://', 'https://', 'www.'))
-            
-            if is_url:
-                # Handle URL
-                song_info = await self.get_song_info(query)
-                if not song_info:
-                    await ctx.send("❌ Could not get song information!")
-                    return None
-                
-                if isinstance(song_info, list):
-                    queue = self.bot.get_queue(ctx.guild.id)
-                    for song in song_info:
-                        if song:
-                            queue.append(song)
-                    await ctx.send(f"📝 Added **{len(song_info)}** songs from playlist!")
-                    if not ctx.voice_client.is_playing():
-                        await self.play_next(ctx)
-                    return song_info
-                
-                queue = self.bot.get_queue(ctx.guild.id)
-                queue.append(song_info)
-                
-                if not ctx.voice_client.is_playing():
-                    await self.play_next(ctx)
-                else:
-                    await ctx.send(f"📝 Added: **{song_info['title']}** (Position: {len(queue)})")
-                return song_info
-            
-            # Search for song
-            results = await self.search_song(query, limit=3)
-            if not results:
-                await ctx.send(f"❌ No results found for: **{query}**")
-                return None
-            
-            song = results[0]
-            queue = self.bot.get_queue(ctx.guild.id)
-            queue.append(song)
-            
-            if not ctx.voice_client.is_playing():
-                await self.play_next(ctx)
-            else:
-                await ctx.send(f"📝 Added: **{song['title']}** (Position: {len(queue)})")
-            return song
-            
-        except Exception as e:
-            logger.error(f"Play error: {e}")
-            await ctx.send(f"❌ Error: {str(e)[:100]}")
-            return None
-
     async def get_song_info(self, url):
         """Get detailed song information"""
         try:
@@ -493,6 +448,94 @@ class MusicPlayer:
                 
         except Exception as e:
             logger.error(f"Info error: {e}")
+            return None
+
+    async def play_song(self, ctx, query):
+        """Main play function - supports ALL languages!"""
+        try:
+            if not ctx.author.voice:
+                await ctx.send("❌ You need to be in a voice channel!")
+                return None
+            
+            voice_channel = ctx.author.voice.channel
+            if ctx.voice_client is None:
+                await voice_channel.connect(timeout=10.0)
+            elif ctx.voice_client.channel != voice_channel:
+                await ctx.voice_client.move_to(voice_channel)
+            
+            # Check if it's a URL
+            is_url = query.startswith(('http://', 'https://', 'www.'))
+            
+            if is_url:
+                song_info = await self.get_song_info(query)
+                if not song_info:
+                    await ctx.send("❌ Could not get song information!")
+                    return None
+                
+                if isinstance(song_info, list):
+                    queue = self.bot.get_queue(ctx.guild.id)
+                    for song in song_info:
+                        if song:
+                            queue.append(song)
+                    await ctx.send(f"📝 Added **{len(song_info)}** songs from playlist!")
+                    if not ctx.voice_client.is_playing():
+                        await self.play_next(ctx)
+                    return song_info
+                
+                queue = self.bot.get_queue(ctx.guild.id)
+                queue.append(song_info)
+                
+                if not ctx.voice_client.is_playing():
+                    await self.play_next(ctx)
+                else:
+                    await ctx.send(f"📝 Added: **{song_info['title']}** (Position: {len(queue)})")
+                return song_info
+            
+            # Check Kurdish database first
+            kurdish_songs = self.bot.kurdish_finder.find_kurdish_songs(query)
+            if kurdish_songs:
+                for song in kurdish_songs[:3]:
+                    search_query = f"{song} kurdish"
+                    results = await self.search_song(search_query, limit=1)
+                    if results:
+                        song_data = results[0]
+                        queue = self.bot.get_queue(ctx.guild.id)
+                        queue.append(song_data)
+                        
+                        if not ctx.voice_client.is_playing():
+                            await self.play_next(ctx)
+                        else:
+                            await ctx.send(f"📝 Added Kurdish song: **{song_data['title']}** (Position: {len(queue)})")
+                        return song_data
+            
+            # Regular search
+            results = await self.search_song(query, limit=3)
+            if not results:
+                # Try with Kurdish keyword as last resort
+                try:
+                    kurdish_search = await self.search_song(f"{query} kurdish", limit=3)
+                    if kurdish_search:
+                        results = kurdish_search
+                except:
+                    pass
+                
+                if not results:
+                    await ctx.send(f"❌ No results found for: **{query}**")
+                    return None
+            
+            song = results[0]
+            queue = self.bot.get_queue(ctx.guild.id)
+            queue.append(song)
+            
+            if not ctx.voice_client.is_playing():
+                await self.play_next(ctx)
+            else:
+                await ctx.send(f"📝 Added: **{song['title']}** (Position: {len(queue)})")
+            return song
+            
+        except Exception as e:
+            logger.error(f"Play error: {e}")
+            await ctx.send(f"❌ Error: {str(e)[:100]}")
             return None
 
     async def play_next(self, ctx):

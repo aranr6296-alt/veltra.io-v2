@@ -27,20 +27,13 @@ TOKEN = os.getenv('DISCORD_TOKEN', 'YOUR_BOT_TOKEN_HERE')
 PREFIX = os.getenv('PREFIX', '$')
 MAX_QUEUE_SIZE = 500
 
-# Check if ffmpeg is available
-try:
-    subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
-    logger.info("✅ FFmpeg is available")
-except:
-    logger.warning("⚠️ FFmpeg not found, using fallback")
-
-# FFmpeg options for Railway
+# FFmpeg options
 FFMPEG_OPTIONS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
     'options': '-vn -bufsize 64k -loglevel quiet'
 }
 
-# yt-dlp options - OPTIMIZED FOR RAILWAY
+# yt-dlp options
 YDL_OPTIONS = {
     'format': 'bestaudio/best',
     'postprocessors': [{
@@ -182,66 +175,7 @@ class KurdishSongFinder:
     def get_random_kurdish_song(self):
         return random.choice(self.all_kurdish_songs)
 
-# ============== MAIN BOT CLASS ==============
-class MusicBot(commands.Bot):
-    def __init__(self):
-        intents = discord.Intents.default()
-        intents.message_content = True
-        intents.voice_states = True
-        intents.guilds = True
-        
-        super().__init__(
-            command_prefix=PREFIX,
-            intents=intents,
-            help_command=None
-        )
-        
-        self.queues = {}
-        self.current_songs = {}
-        self.loop = {}
-        self.volume = {}
-        self.history = {}
-        self.kurdish_finder = KurdishSongFinder()
-        self.music_player = None
-        self.stats = {'total_plays': 0}
-        
-        os.makedirs('/tmp/downloads', exist_ok=True)
-        os.makedirs('data', exist_ok=True)
-        
-        logger.info(f"🤖 Bot initialized with {len(self.kurdish_finder.all_kurdish_songs)} Kurdish songs")
-
-    async def setup_hook(self):
-        try:
-            await self.tree.sync()
-            logger.info("✅ Slash commands synced")
-        except Exception as e:
-            logger.error(f"Slash sync error: {e}")
-
-    def get_queue(self, guild_id):
-        if guild_id not in self.queues:
-            self.queues[guild_id] = deque(maxlen=MAX_QUEUE_SIZE)
-        return self.queues[guild_id]
-
-    def get_current_song(self, guild_id):
-        return self.current_songs.get(guild_id)
-
-    def set_current_song(self, guild_id, song):
-        self.current_songs[guild_id] = song
-
-    def get_loop(self, guild_id):
-        return self.loop.get(guild_id, False)
-
-    def toggle_loop(self, guild_id):
-        self.loop[guild_id] = not self.loop.get(guild_id, False)
-        return self.loop[guild_id]
-
-    def get_volume(self, guild_id):
-        return self.volume.get(guild_id, 50)
-
-    def set_volume(self, guild_id, vol):
-        self.volume[guild_id] = max(0, min(200, vol))
-
-# ========== MUSIC PLAYER CLASS ==========
+# ============== MUSIC PLAYER CLASS ==============
 class MusicPlayer:
     def __init__(self, bot):
         self.bot = bot
@@ -272,7 +206,7 @@ class MusicPlayer:
             return 'N/A'
 
     async def search_song(self, query, limit=5):
-        """Search for songs using yt-dlp - NO external libraries needed!"""
+        """Search for songs using yt-dlp"""
         try:
             results = []
             
@@ -453,13 +387,16 @@ class MusicPlayer:
     async def play_song(self, ctx, query):
         """Main play function - supports ALL languages!"""
         try:
+            # Check if user is in voice channel
             if not ctx.author.voice:
                 await ctx.send("❌ You need to be in a voice channel!")
                 return None
             
+            # Join voice channel
             voice_channel = ctx.author.voice.channel
             if ctx.voice_client is None:
                 await voice_channel.connect(timeout=10.0)
+                logger.info(f"✅ Joined voice channel: {voice_channel.name}")
             elif ctx.voice_client.channel != voice_channel:
                 await ctx.voice_client.move_to(voice_channel)
             
@@ -628,9 +565,75 @@ class MusicPlayer:
             await ctx.send(f"❌ Playback error, skipping...")
             await self.play_next(ctx)
 
+# ============== MAIN BOT CLASS ==============
+class MusicBot(commands.Bot):
+    def __init__(self):
+        # Enable all required intents
+        intents = discord.Intents.default()
+        intents.message_content = True  # REQUIRED for reading messages
+        intents.voice_states = True     # REQUIRED for voice
+        intents.guilds = True
+        intents.members = True
+        
+        super().__init__(
+            command_prefix=PREFIX,
+            intents=intents,
+            help_command=None
+        )
+        
+        # Data storage
+        self.queues = {}
+        self.current_songs = {}
+        self.loop = {}
+        self.volume = {}
+        self.history = {}
+        self.kurdish_finder = KurdishSongFinder()
+        self.music_player = None
+        self.stats = {'total_plays': 0}
+        
+        # Create directories
+        os.makedirs('/tmp/downloads', exist_ok=True)
+        os.makedirs('data', exist_ok=True)
+        
+        # Initialize music player
+        self.music_player = MusicPlayer(self)
+        
+        logger.info(f"🤖 Bot initialized with {len(self.kurdish_finder.all_kurdish_songs)} Kurdish songs")
+
+    async def setup_hook(self):
+        """Setup slash commands"""
+        try:
+            await self.tree.sync()
+            logger.info("✅ Slash commands synced")
+        except Exception as e:
+            logger.error(f"Slash sync error: {e}")
+
+    def get_queue(self, guild_id):
+        if guild_id not in self.queues:
+            self.queues[guild_id] = deque(maxlen=MAX_QUEUE_SIZE)
+        return self.queues[guild_id]
+
+    def get_current_song(self, guild_id):
+        return self.current_songs.get(guild_id)
+
+    def set_current_song(self, guild_id, song):
+        self.current_songs[guild_id] = song
+
+    def get_loop(self, guild_id):
+        return self.loop.get(guild_id, False)
+
+    def toggle_loop(self, guild_id):
+        self.loop[guild_id] = not self.loop.get(guild_id, False)
+        return self.loop[guild_id]
+
+    def get_volume(self, guild_id):
+        return self.volume.get(guild_id, 50)
+
+    def set_volume(self, guild_id, vol):
+        self.volume[guild_id] = max(0, min(200, vol))
+
 # ========== INITIALIZE BOT ==========
 bot = MusicBot()
-bot.music_player = MusicPlayer(bot)
 
 # ========== TEXT COMMANDS ==========
 
@@ -1124,6 +1127,8 @@ async def on_ready():
     logger.info(f'📊 Connected to {len(bot.guilds)} servers')
     logger.info(f'🇰🇲 Loaded {len(bot.kurdish_finder.all_kurdish_songs)} Kurdish songs!')
     logger.info(f'🎵 Universal Music Bot is ready!')
+    logger.info(f'📝 Prefix: {PREFIX}')
+    logger.info(f'💡 Try: {PREFIX}play <song name>')
     
     await bot.change_presence(
         activity=Activity(
@@ -1169,7 +1174,7 @@ async def on_error(event, *args, **kwargs):
 
 if __name__ == "__main__":
     if not TOKEN or TOKEN == 'YOUR_BOT_TOKEN_HERE':
-        logger.error("❌ No bot token found!")
+        logger.error("❌ No bot token found! Set DISCORD_TOKEN in .env file")
         sys.exit(1)
     
     try:
@@ -1181,3 +1186,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"❌ Failed to start: {e}")
         sys.exit(1)
+        

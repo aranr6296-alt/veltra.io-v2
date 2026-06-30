@@ -18,6 +18,8 @@ import aiohttp
 import logging
 import traceback
 import re
+import json
+import shutil
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -48,6 +50,15 @@ C_LUNA   = 0xB5179E
 C_GREEN  = 0x57F287
 C_RED    = 0xED4245
 C_YELLOW = 0xFEE75C
+
+# ── yt-dlp binary (primary audio extractor for YouTube) ──
+YTDLP_BIN = (
+    shutil.which("yt-dlp")
+    or os.path.expanduser("~/.local/bin/yt-dlp")
+    or "/home/user/.local/bin/yt-dlp"
+)
+if not os.path.isfile(YTDLP_BIN or ""):
+    YTDLP_BIN = None
 
 # All URLs must include https:// prefix — BUG FIX: many were missing https://
 INVIDIOUS_STREAM = [
@@ -694,6 +705,69 @@ async def search_songs(query, kurdish_mode=True, force_kurdish=False):
 # ═══════════════════════════════════════
 #  STREAM EXTRACTION
 # ═══════════════════════════════════════
+async def _ytdlp_extract(url: str) -> dict | None:
+    """
+    Primary audio extractor — uses yt-dlp subprocess.
+    Works for YouTube, VideoMate, and most other platforms.
+    This is the most reliable method — returns a direct playable stream URL.
+    """
+    if not YTDLP_BIN:
+        log.warning("yt-dlp binary not found — skipping")
+        return None
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            YTDLP_BIN,
+            "-f", "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
+            "--no-playlist",
+            "-j",                    # JSON output with all metadata
+            "--no-warnings",
+            "--quiet",
+            "--no-check-certificate",
+            url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=25)
+        except asyncio.TimeoutError:
+            proc.kill()
+            log.warning(f"yt-dlp timed out for: {url[:60]}")
+            return None
+
+        if proc.returncode != 0 or not stdout:
+            err_msg = stderr.decode(errors="ignore")[:200] if stderr else "no output"
+            log.debug(f"yt-dlp failed (rc={proc.returncode}): {err_msg}")
+            return None
+
+        data = json.loads(stdout.decode(errors="ignore"))
+
+        stream_url = data.get("url") or data.get("manifest_url")
+        if not stream_url:
+            log.debug("yt-dlp returned no stream URL")
+            return None
+
+        # HTTP headers yt-dlp says are required for this stream
+        http_headers = data.get("http_headers") or {}
+
+        return {
+            "url":         stream_url,
+            "webpage_url": data.get("webpage_url") or url,
+            "title":       data.get("title") or "Unknown",
+            "duration":    int(data.get("duration") or 0),
+            "thumbnail":   data.get("thumbnail") or "",
+            "uploader":    data.get("uploader") or data.get("channel") or "Unknown",
+            "http_headers": http_headers,
+        }
+
+    except json.JSONDecodeError as e:
+        log.debug(f"yt-dlp JSON parse error: {e}")
+        return None
+    except Exception as e:
+        log.debug(f"yt-dlp error: {e}")
+        return None
+
+
 async def _get_cobalt_stream(session, url):
     """
     Cobalt API extracts direct audio from:
@@ -774,12 +848,16 @@ async def _get_inv_stream(session, base_url, video_id):
 
 async def instant_extract(url):
     """
-    Extract audio stream from URL.
-    1. Cobalt API for direct platform links (Spotify, SC, Deezer, Apple, MP3, etc.)
-    2. Invidious (parallel requests) for YouTube / VideoMate links
+    Extract a playable audio stream URL from any supported link.
+
+    Priority order:
+      1. yt-dlp        — YouTube / VideoMate (most reliable, gives real CDN URL)
+      2. Cobalt API    — Spotify, Apple Music, SoundCloud, Deezer, Facebook, etc.
+      3. Invidious     — YouTube fallback if yt-dlp is unavailable
     """
     platform = detect_platform(url)
 
+    # ── NON-YOUTUBE PLATFORMS → Cobalt ──────────────────────────────────────
     if platform in ("spotify", "apple_music", "soundcloud", "deezer",
                     "anghami", "facebook", "twitch", "vimeo", "direct"):
         async with aiohttp.ClientSession() as session:
@@ -787,8 +865,19 @@ async def instant_extract(url):
             if result:
                 log.info(f"Extracted via Cobalt from {platform}")
                 return result
+        # Cobalt failed — nothing else can handle these platforms
+        return None
 
-    # For YouTube / VideoMate links, try Invidious (parallel)
+    # ── YOUTUBE / VIDEOMATE → yt-dlp first, Invidious fallback ──────────────
+    # yt-dlp is the gold standard: handles age-gated, live, signed URLs, etc.
+    if YTDLP_BIN:
+        result = await _ytdlp_extract(url)
+        if result:
+            log.info(f"Extracted via yt-dlp: {result.get('title','?')[:50]}")
+            return result
+        log.warning("yt-dlp extraction failed — trying Invidious fallback")
+
+    # ── INVIDIOUS FALLBACK (parallel race) ──────────────────────────────────
     video_id = None
     if "youtu.be/" in url:
         video_id = url.split("youtu.be/")[1].split("?")[0]
@@ -799,36 +888,68 @@ async def instant_extract(url):
         video_id = re.sub(r'[^a-zA-Z0-9_-]', '', video_id)
 
     if video_id and len(video_id) >= 11:
-        video_id = video_id[:11]  # Trim to exactly 11 chars
+        video_id = video_id[:11]
         async with aiohttp.ClientSession() as session:
             tasks = [_get_inv_stream(session, base, video_id) for base in INVIDIOUS_STREAM]
             for future in asyncio.as_completed(tasks):
                 try:
                     result = await future
                     if result:
-                        log.info("Extracted stream via Invidious")
+                        log.info("Extracted stream via Invidious fallback")
                         return result
                 except Exception:
                     continue
 
+    log.error(f"All extraction methods failed for: {url[:80]}")
     return None
 
 
 # ═══════════════════════════════════════
 #  AUDIO SOURCE CREATION
 # ═══════════════════════════════════════
-def create_ffmpeg_source(stream_url, volume, filter_name):
+# Default User-Agent that YouTube CDN / most stream hosts accept
+_DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.36"
+)
+
+
+def create_ffmpeg_source(stream_url, volume, filter_name, http_headers: dict = None):
+    """
+    Create a discord audio source from a direct stream URL.
+
+    http_headers: dict of headers yt-dlp says are required for this stream.
+                  If None, a standard User-Agent is used automatically.
+    """
     if not stream_url:
         return None
 
     af = FILTERS.get(filter_name, FILTERS["none"])["af"]
-    before_opts = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
-    options = "-vn"
+
+    # ── Build the User-Agent string ──────────────────────────────────────────
+    ua = _DEFAULT_UA
+    if http_headers:
+        ua = http_headers.get("User-Agent") or http_headers.get("user-agent") or ua
+
+    # ── Build before_options ─────────────────────────────────────────────────
+    # -reconnect* flags make FFmpeg retry when the CDN drops the connection
+    # (common with YouTube signed URLs that expire mid-stream).
+    # -user_agent sets the UA so CDN servers don't reject the request.
+    before_opts = (
+        "-reconnect 1 "
+        "-reconnect_streamed 1 "
+        "-reconnect_delay_max 5 "
+        "-reconnect_on_network_error 1 "
+        f"-user_agent \"{ua}\""
+    )
+
+    # ── Audio-only output, optional filter chain ─────────────────────────────
+    options = "-vn"          # strip video track (important for combined streams)
     if af:
         options += f" -af {af}"
 
     try:
-        # BUG FIX: was discord.FMPEGPCMAudio (typo) — correct is FFmpegPCMAudio
         pcm = discord.FFmpegPCMAudio(
             stream_url,
             before_options=before_opts,
@@ -836,7 +957,7 @@ def create_ffmpeg_source(stream_url, volume, filter_name):
         )
         return discord.PCMVolumeTransformer(pcm, volume=volume)
     except Exception as e:
-        log.error(f"FFmpeg error: {e}")
+        log.error(f"FFmpeg source creation error: {e}")
         return None
 
 
@@ -846,28 +967,25 @@ def create_ffmpeg_source(stream_url, volume, filter_name):
 class Song:
     __slots__ = (
         "title", "url", "stream_url", "duration", "thumbnail",
-        "uploader", "requester", "platform", "is_kurdish",
+        "uploader", "requester", "platform", "is_kurdish", "http_headers",
     )
 
     def __init__(self, data, requester, platform="unknown"):
         self.title      = str(data.get("title") or "Unknown")
-        # webpage_url = the original platform/YouTube URL (used for re-extraction if needed)
-        # stream_url  = the direct audio stream URL (set when extraction has already happened)
-        # BUG FIX: instant_extract() returns {"url": <stream>} without "stream_url" key.
-        # We normalise here so stream_url is always the extracted audio link when available,
-        # and url is always the shareable/original page link.
+        # webpage_url = the original platform/YouTube URL (for display & re-extraction)
+        # stream_url  = the direct playable audio URL (set once extraction succeeds)
         self.url        = str(data.get("webpage_url") or "")
         self.stream_url = str(data.get("stream_url") or data.get("url") or "")
-        # If webpage_url was absent, fall back to stream_url as the display URL only when
-        # no better value exists (e.g. direct .mp3 links are both the page and the stream).
         if not self.url:
             self.url = self.stream_url
-        self.duration   = data.get("duration") or 0
-        self.thumbnail  = str(data.get("thumbnail") or "")
-        self.uploader   = str(data.get("uploader") or data.get("channel") or "Unknown")
-        self.requester  = requester
-        self.platform   = platform
-        self.is_kurdish = is_kurdish(self.title)
+        self.duration    = data.get("duration") or 0
+        self.thumbnail   = str(data.get("thumbnail") or "")
+        self.uploader    = str(data.get("uploader") or data.get("channel") or "Unknown")
+        self.requester   = requester
+        self.platform    = platform
+        self.is_kurdish  = is_kurdish(self.title)
+        # HTTP headers required by yt-dlp for this stream (e.g. User-Agent, Referer)
+        self.http_headers: dict = data.get("http_headers") or {}
 
     @property
     def dur_str(self):
@@ -1301,7 +1419,8 @@ async def play_next(guild_id: int, text_channel, vc: discord.VoiceClient):
                 await play_next(guild_id, text_channel, vc)
                 return
 
-            song.stream_url = data["url"]
+            song.stream_url   = data["url"]
+            song.http_headers = data.get("http_headers") or {}
             if data.get("title") and data["title"] != "Unknown":
                 song.title = data["title"]
             if data.get("duration"):
@@ -1312,7 +1431,9 @@ async def play_next(guild_id: int, text_channel, vc: discord.VoiceClient):
                 song.uploader = data["uploader"]
 
         # ── CREATE AUDIO SOURCE ──
-        source = create_ffmpeg_source(song.stream_url, player.volume, player.filter_name)
+        source = create_ffmpeg_source(
+            song.stream_url, player.volume, player.filter_name, song.http_headers
+        )
 
         if not source:
             if text_channel:
@@ -1904,8 +2025,11 @@ async def setfilter(ctx: commands.Context, name: str = None):
         data = await instant_extract(player.current.url)
 
         if data and data.get("url"):
-            player.current.stream_url = data["url"]
-            source = create_ffmpeg_source(player.current.stream_url, player.volume, name)
+            player.current.stream_url   = data["url"]
+            player.current.http_headers = data.get("http_headers") or {}
+            source = create_ffmpeg_source(
+                player.current.stream_url, player.volume, name, player.current.http_headers
+            )
 
             if source:
                 player.reset_timer()

@@ -11,6 +11,8 @@ import logging
 import sys
 import subprocess
 import hashlib
+import json
+import re
 
 # Load environment variables
 load_dotenv()
@@ -31,10 +33,10 @@ KURDISH_SONG_DATABASE = {
     'hesen zîrek': ['ez ketim', 'keçelok', 'xerîbî', 'daye min', 'bavê min'],
     'aram tigran': ['keçelo', 'xerîb', 'derd', 'derdê min', 'evîna min'],
     'rojan': ['kurdistan', 'azadî', 'serxwebûn', 'xwezî', 'keça kurd'],
+    'rostam sabir': ['xewn', 'evîn', 'derd', 'kurdistan', 'azadî', 'stran', 'delal', 'dil', 'rostam sabir'],
     'kurmancî': ['strana kurmancî', 'kilama kurmancî', 'dengê kurmancî'],
     'soranî': ['strana soranî', 'kilama soranî', 'dengê soranî'],
-    'dengbej': ['kilama dengbêj', 'strana dengbêj', 'dengê dengbêj'],
-    'rostam sabir': ['xewn', 'evîn', 'derd', 'kurdistan', 'azadî', 'stran', 'delal', 'dil']
+    'dengbej': ['kilama dengbêj', 'strana dengbêj', 'dengê dengbêj']
 }
 
 # Flatten the database
@@ -48,7 +50,6 @@ logger.info(f"📚 Loaded {len(ALL_KURDISH_SONGS)} Kurdish songs")
 # ============== BOT CLASS ==============
 class MusicBot(commands.Bot):
     def __init__(self):
-        # Enable ALL required intents
         intents = discord.Intents.all()
         
         super().__init__(
@@ -57,19 +58,16 @@ class MusicBot(commands.Bot):
             help_command=None
         )
         
-        # Data storage
         self.queues = {}
         self.current_songs = {}
         self.loop = {}
         self.volume = {}
         
-        # Create directories
         os.makedirs('/tmp/downloads', exist_ok=True)
         
         logger.info("🤖 Bot initialized")
 
     async def setup_hook(self):
-        """Sync slash commands"""
         try:
             await self.tree.sync()
             logger.info("✅ Slash commands synced")
@@ -120,41 +118,81 @@ class MusicPlayer:
             return 'N/A'
 
     async def search_song(self, query):
-        """Search for a song using yt-dlp"""
+        """Search for a song using yt-dlp - FIXED VERSION"""
         try:
+            # Updated yt-dlp options for better compatibility
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
-                'extract_flat': True,
+                'extract_flat': False,
                 'default_search': 'ytsearch',
                 'max_downloads': 3,
-                'socket_timeout': 30
+                'socket_timeout': 30,
+                'format': 'bestaudio/best',
+                'extract_audio': True,
+                'audio_format': 'mp3',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
             }
             
-            search_query = query
-            # If it's a Kurdish search, add "kurdish" keyword
-            if any(song in query.lower() for song in ['kurd', 'kurdish', 'kurdî', 'kurmancî', 'soranî']):
-                search_query = f"{query} kurdish"
+            # Try different search queries
+            search_queries = [
+                query,
+                f"{query} music",
+                f"{query} song"
+            ]
             
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                search_results = await asyncio.to_thread(
-                    ydl.extract_info, 
-                    f"ytsearch3:{search_query}", 
-                    download=False
-                )
-                
-                if search_results and 'entries' in search_results:
-                    for entry in search_results['entries']:
-                        if entry:
-                            url = entry.get('url', entry.get('webpage_url', ''))
-                            if url:
-                                return {
-                                    'title': entry.get('title', 'Unknown')[:100],
-                                    'url': url,
-                                    'duration': self.format_duration(entry.get('duration', 0)),
-                                    'thumbnail': entry.get('thumbnail', ''),
-                                    'channel': entry.get('channel', entry.get('uploader', 'Unknown'))
-                                }
+            # If it's Kurdish, add Kurdish keywords
+            if any(word in query.lower() for word in ['kurd', 'kurdish', 'kurdî', 'kurmancî', 'soranî', 'rostam']):
+                search_queries.extend([
+                    f"{query} kurdish",
+                    f"{query} kurdî",
+                    f"kurdish {query}"
+                ])
+            
+            for search_query in search_queries:
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        search_results = await asyncio.to_thread(
+                            ydl.extract_info, 
+                            f"ytsearch3:{search_query}", 
+                            download=False
+                        )
+                        
+                        if search_results and 'entries' in search_results:
+                            for entry in search_results['entries']:
+                                if entry and entry.get('url'):
+                                    # Get full video info
+                                    try:
+                                        full_info = await asyncio.to_thread(
+                                            ydl.extract_info,
+                                            entry.get('url', entry.get('webpage_url', '')),
+                                            download=False
+                                        )
+                                        if full_info:
+                                            return {
+                                                'title': full_info.get('title', 'Unknown')[:100],
+                                                'url': entry.get('url', entry.get('webpage_url', '')),
+                                                'duration': self.format_duration(full_info.get('duration', 0)),
+                                                'thumbnail': full_info.get('thumbnail', ''),
+                                                'channel': full_info.get('channel', full_info.get('uploader', 'Unknown')),
+                                                'full_info': full_info
+                                            }
+                                    except:
+                                        # If we can't get full info, use the entry
+                                        return {
+                                            'title': entry.get('title', 'Unknown')[:100],
+                                            'url': entry.get('url', entry.get('webpage_url', '')),
+                                            'duration': self.format_duration(entry.get('duration', 0)),
+                                            'thumbnail': entry.get('thumbnail', ''),
+                                            'channel': entry.get('channel', entry.get('uploader', 'Unknown'))
+                                        }
+                except Exception as e:
+                    logger.warning(f"Search attempt failed: {e}")
+                    continue
             
             return None
             
@@ -163,16 +201,17 @@ class MusicPlayer:
             return None
 
     async def download_audio(self, url):
-        """Download audio from YouTube"""
+        """Download audio from YouTube - FIXED VERSION"""
         try:
             url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
             filename = f"/tmp/audio_{url_hash}.mp3"
             
             # Check cache
-            if os.path.exists(filename) and os.path.getsize(filename) > 10000:
-                logger.info(f"✅ Using cached: {filename}")
+            if os.path.exists(filename) and os.path.getsize(filename) > 50000:
+                logger.info(f"✅ Using cached audio: {filename}")
                 return filename
             
+            # Updated yt-dlp options for better audio download
             ydl_opts = {
                 'format': 'bestaudio/best',
                 'postprocessors': [{
@@ -186,42 +225,62 @@ class MusicPlayer:
                 'ignoreerrors': True,
                 'quiet': True,
                 'no_warnings': True,
-                'socket_timeout': 30,
-                'retries': 5,
-                'fragment_retries': 5,
+                'socket_timeout': 60,
+                'retries': 10,
+                'fragment_retries': 10,
                 'noplaylist': True,
+                'extract_audio': True,
+                'audio_format': 'mp3',
+                'audio_quality': 0,
+                'writeinfojson': False,
+                'writethumbnail': False,
+                'writesubtitles': False,
+                'writeautomaticsub': False,
             }
             
-            logger.info(f"⬇️ Downloading audio...")
+            logger.info(f"⬇️ Downloading audio from: {url[:50]}...")
             
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                await asyncio.to_thread(ydl.extract_info, url, download=True)
-            
-            # Check if file exists with any extension
-            for ext in ['.mp3', '.webm', '.m4a', '.opus']:
-                check_file = f"/tmp/audio_{url_hash}{ext}"
-                if os.path.exists(check_file) and os.path.getsize(check_file) > 10000:
-                    logger.info(f"✅ Downloaded: {check_file}")
-                    if not check_file.endswith('.mp3'):
-                        new_file = f"/tmp/audio_{url_hash}.mp3"
-                        try:
-                            cmd = ['ffmpeg', '-i', check_file, '-acodec', 'libmp3lame', '-q:a', '2', new_file, '-y', '-loglevel', 'quiet']
-                            await asyncio.to_thread(subprocess.run, cmd, capture_output=True)
-                            os.remove(check_file)
-                            if os.path.exists(new_file):
-                                return new_file
-                        except:
-                            return check_file
-                    return check_file
-            
-            return None
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    await asyncio.to_thread(ydl.extract_info, url, download=True)
+                
+                # Check for downloaded file
+                for ext in ['.mp3', '.webm', '.m4a', '.opus']:
+                    check_file = f"/tmp/audio_{url_hash}{ext}"
+                    if os.path.exists(check_file) and os.path.getsize(check_file) > 50000:
+                        # If it's not mp3, convert it to mp3
+                        if not check_file.endswith('.mp3'):
+                            new_file = f"/tmp/audio_{url_hash}.mp3"
+                            try:
+                                cmd = ['ffmpeg', '-i', check_file, '-acodec', 'libmp3lame', '-q:a', '2', new_file, '-y', '-loglevel', 'quiet']
+                                await asyncio.to_thread(subprocess.run, cmd, capture_output=True, timeout=60)
+                                if os.path.exists(new_file) and os.path.getsize(new_file) > 50000:
+                                    os.remove(check_file)
+                                    logger.info(f"✅ Converted to MP3: {new_file}")
+                                    return new_file
+                            except:
+                                return check_file
+                        return check_file
+                
+                # Try to find any file with the base name
+                for file in os.listdir('/tmp'):
+                    if file.startswith(f"audio_{url_hash}") and os.path.getsize(f"/tmp/{file}") > 50000:
+                        logger.info(f"✅ Found audio: /tmp/{file}")
+                        return f"/tmp/{file}"
+                
+                logger.error("❌ No audio file found after download")
+                return None
+                
+            except Exception as e:
+                logger.error(f"Download error: {e}")
+                return None
             
         except Exception as e:
             logger.error(f"Download error: {e}")
             return None
 
     async def play_song(self, ctx, query):
-        """Play a song"""
+        """Play a song - FIXED VERSION"""
         try:
             # Check voice channel
             if not ctx.author.voice:
@@ -259,7 +318,7 @@ class MusicPlayer:
             return None
 
     async def play_next(self, ctx):
-        """Play next song in queue"""
+        """Play next song in queue - FIXED VERSION"""
         try:
             queue = self.bot.get_queue(ctx.guild.id)
             
@@ -279,14 +338,29 @@ class MusicPlayer:
             song = queue.popleft()
             self.bot.set_current_song(ctx.guild.id, song)
             
-            # Download audio
-            audio_file = await self.download_audio(song['url'])
+            logger.info(f"🎯 Playing: {song.get('title', 'Unknown')}")
+            
+            # Download audio with retry
+            audio_file = None
+            for attempt in range(3):
+                audio_file = await self.download_audio(song['url'])
+                if audio_file:
+                    break
+                logger.warning(f"Download attempt {attempt + 1} failed, retrying...")
+                await asyncio.sleep(2)
+            
             if not audio_file:
                 await ctx.send(f"❌ Failed to download: {song.get('title', 'Unknown')}")
                 await self.play_next(ctx)
                 return
             
-            # Create audio source
+            # Verify file
+            if not os.path.exists(audio_file) or os.path.getsize(audio_file) < 50000:
+                await ctx.send(f"❌ Invalid audio file: {song.get('title', 'Unknown')}")
+                await self.play_next(ctx)
+                return
+            
+            # Create audio source with proper settings
             volume = self.bot.get_volume(ctx.guild.id) / 100
             
             audio = FFmpegPCMAudio(
@@ -301,13 +375,21 @@ class MusicPlayer:
                 try:
                     if os.path.exists(audio_file):
                         os.remove(audio_file)
+                        logger.info(f"🗑️ Removed: {audio_file}")
                 except:
                     pass
                 asyncio.run_coroutine_threadsafe(self.play_next(ctx), self.bot.loop)
             
-            ctx.voice_client.play(audio, after=after_playing)
+            # Play the audio
+            try:
+                ctx.voice_client.play(audio, after=after_playing)
+            except Exception as e:
+                logger.error(f"FFmpeg play error: {e}")
+                await ctx.send(f"❌ FFmpeg error: {str(e)[:100]}")
+                await self.play_next(ctx)
+                return
             
-            # Send now playing
+            # Send now playing embed
             embed = Embed(
                 title="🎵 Now Playing",
                 description=f"**{song.get('title', 'Unknown')}**",
@@ -345,46 +427,19 @@ async def on_message(message):
     if message.author.bot:
         return
     
-    # Log all messages for debugging
     if message.content.startswith(PREFIX):
         logger.info(f"📝 Command received: {message.content} from {message.author.name}")
     
-    # Process commands
     await bot.process_commands(message)
 
 @bot.command(name='test', aliases=['t'])
 async def test_command(ctx):
-    """Test if bot responds"""
     await ctx.send("✅ Bot is responding! Your prefix is `$`")
-    logger.info(f"✅ Test command executed by {ctx.author.name}")
 
 @bot.command(name='ping')
 async def ping(ctx):
-    """Check bot latency"""
     latency = round(bot.latency * 1000)
     await ctx.send(f"🏓 Pong! Latency: {latency}ms")
-    logger.info(f"✅ Ping command executed by {ctx.author.name}")
-
-@bot.command(name='server')
-async def server_info(ctx):
-    """Show server info"""
-    embed = Embed(
-        title="📊 Server Info",
-        color=Color.blue()
-    )
-    embed.add_field(name="Server Name", value=ctx.guild.name, inline=True)
-    embed.add_field(name="Members", value=ctx.guild.member_count, inline=True)
-    embed.add_field(name="Channels", value=len(ctx.guild.channels), inline=True)
-    embed.add_field(name="Bot Prefix", value=PREFIX, inline=True)
-    embed.add_field(name="Bot Latency", value=f"{round(bot.latency * 1000)}ms", inline=True)
-    await ctx.send(embed=embed)
-    logger.info(f"✅ Server info command executed by {ctx.author.name}")
-
-@bot.command(name='whoami')
-async def whoami(ctx):
-    """Show user info"""
-    await ctx.send(f"👤 You are **{ctx.author.name}** (ID: {ctx.author.id})")
-    logger.info(f"✅ Whoami command executed by {ctx.author.name}")
 
 # ========== TEXT COMMANDS ==========
 
@@ -416,7 +471,6 @@ async def kurdish(ctx, *, query=None):
         await ctx.send(f"🎵 Try this Kurdish song: **{random_song}**\n💡 Use `$play {random_song}` to play it!")
         return
     
-    # Find matching Kurdish songs
     matched = [song for song in ALL_KURDISH_SONGS if query.lower() in song.lower()]
     if matched:
         embed = Embed(
@@ -435,14 +489,12 @@ async def kurdish(ctx, *, query=None):
 
 @bot.command(name='kurdish-random')
 async def kurdish_random(ctx):
-    """Play a random Kurdish song"""
     random_song = random.choice(ALL_KURDISH_SONGS)
     await ctx.send(f"🎵 Playing random Kurdish song: **{random_song}** 🇰🇲")
     await play(ctx, query=random_song)
 
 @bot.command(name='search')
 async def search(ctx, *, query):
-    """Search for songs"""
     if not query:
         await ctx.send("❌ Please provide a search query!")
         return
@@ -468,7 +520,6 @@ async def search(ctx, *, query):
 
 @bot.command(name='queue', aliases=['q'])
 async def show_queue(ctx):
-    """Show current queue"""
     try:
         queue = bot.get_queue(ctx.guild.id)
         current = bot.get_current_song(ctx.guild.id)
@@ -507,7 +558,6 @@ async def show_queue(ctx):
 
 @bot.command(name='skip', aliases=['s'])
 async def skip(ctx):
-    """Skip current song"""
     if not ctx.voice_client or not ctx.voice_client.is_playing():
         await ctx.send("❌ No song is currently playing!")
         return
@@ -519,7 +569,6 @@ async def skip(ctx):
 
 @bot.command(name='stop')
 async def stop(ctx):
-    """Stop playback and clear queue"""
     try:
         queue = bot.get_queue(ctx.guild.id)
         queue.clear()
@@ -535,7 +584,6 @@ async def stop(ctx):
 
 @bot.command(name='pause')
 async def pause(ctx):
-    """Pause current song"""
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.pause()
         await ctx.send("⏸️ Paused")
@@ -544,7 +592,6 @@ async def pause(ctx):
 
 @bot.command(name='resume')
 async def resume(ctx):
-    """Resume paused song"""
     if ctx.voice_client and ctx.voice_client.is_paused():
         ctx.voice_client.resume()
         await ctx.send("▶️ Resumed")
@@ -553,7 +600,6 @@ async def resume(ctx):
 
 @bot.command(name='loop')
 async def loop(ctx):
-    """Toggle loop mode"""
     if not bot.get_current_song(ctx.guild.id):
         await ctx.send("❌ No song playing!")
         return
@@ -563,7 +609,6 @@ async def loop(ctx):
 
 @bot.command(name='volume', aliases=['vol'])
 async def volume(ctx, level: int = None):
-    """Set volume (0-200%)"""
     if level is None:
         await ctx.send(f"🔊 Volume: **{bot.get_volume(ctx.guild.id)}%**")
         return
@@ -577,7 +622,6 @@ async def volume(ctx, level: int = None):
 
 @bot.command(name='remove')
 async def remove_from_queue(ctx, position: int):
-    """Remove song from queue"""
     queue = bot.get_queue(ctx.guild.id)
     if position < 1 or position > len(queue):
         await ctx.send(f"❌ Position must be between 1-{len(queue)}")
@@ -592,7 +636,6 @@ async def remove_from_queue(ctx, position: int):
 
 @bot.command(name='clear')
 async def clear_queue(ctx):
-    """Clear all songs from queue"""
     queue = bot.get_queue(ctx.guild.id)
     count = len(queue)
     queue.clear()
@@ -600,7 +643,6 @@ async def clear_queue(ctx):
 
 @bot.command(name='shuffle')
 async def shuffle_queue(ctx):
-    """Shuffle the queue"""
     queue = bot.get_queue(ctx.guild.id)
     if len(queue) < 2:
         await ctx.send("❌ Need at least 2 songs!")
@@ -614,7 +656,6 @@ async def shuffle_queue(ctx):
 
 @bot.command(name='nowplaying', aliases=['np'])
 async def now_playing(ctx):
-    """Show currently playing song"""
     current = bot.get_current_song(ctx.guild.id)
     if not current:
         await ctx.send("❌ No song playing!")
@@ -641,7 +682,6 @@ async def now_playing(ctx):
 
 @bot.command(name='help', aliases=['h'])
 async def help_command(ctx):
-    """Show help menu"""
     embed = Embed(
         title="🎵 Kurdish Music Bot - Help",
         description="🇰🇲 **Kurdish songs built-in!**\n🌍 Supports ALL languages!",
@@ -684,173 +724,8 @@ async def help_command(ctx):
         inline=False
     )
     
-    embed.add_field(
-        name="🛠️ Diagnostic Commands",
-        value=(
-            "`$test` - Test if bot responds\n"
-            "`$ping` - Check bot latency\n"
-            "`$server` - Show server info\n"
-            "`$whoami` - Show your info"
-        ),
-        inline=False
-    )
-    
     embed.set_footer(text=f"🎵 Prefix: {PREFIX} | 🇰🇲 Kurdish Music Bot")
     await ctx.send(embed=embed)
-
-# ========== SLASH COMMANDS ==========
-
-@bot.tree.command(name="play", description="Play a song")
-async def slash_play(interaction: discord.Interaction, query: str):
-    await interaction.response.defer()
-    ctx = await bot.get_context(interaction)
-    try:
-        result = await player.play_song(ctx, query)
-        if result:
-            await interaction.followup.send(f"🎵 Added: **{result.get('title', 'Song')}**")
-        else:
-            await interaction.followup.send(f"❌ Could not find: **{query}**")
-    except Exception as e:
-        await interaction.followup.send(f"❌ Error: {str(e)[:100]}")
-
-@bot.tree.command(name="search", description="Search for songs")
-async def slash_search(interaction: discord.Interaction, query: str):
-    await interaction.response.defer()
-    try:
-        song = await player.search_song(query)
-        if not song:
-            await interaction.followup.send(f"❌ No results for: **{query}**")
-            return
-        
-        embed = Embed(
-            title="🔍 Search Result",
-            description=f"**{song['title']}**",
-            color=Color.blue()
-        )
-        embed.add_field(name="⏱️ Duration", value=song.get('duration', 'N/A'), inline=True)
-        embed.add_field(name="👤 Channel", value=song.get('channel', 'Unknown'), inline=True)
-        await interaction.followup.send(embed=embed)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Error: {str(e)[:100]}")
-
-@bot.tree.command(name="kurdish", description="Search for Kurdish songs")
-async def slash_kurdish(interaction: discord.Interaction, query: str):
-    await interaction.response.defer()
-    
-    matched = [song for song in ALL_KURDISH_SONGS if query.lower() in song.lower()]
-    if matched:
-        embed = Embed(
-            title="🇰🇲 Kurdish Songs Found",
-            description=f"Found {len(matched)} Kurdish songs!",
-            color=Color.gold()
-        )
-        song_list = []
-        for i, song in enumerate(matched[:20], 1):
-            song_list.append(f"`{i}.` **{song}**")
-        embed.add_field(name="📝 Songs", value="\n".join(song_list), inline=False)
-        await interaction.followup.send(embed=embed)
-    else:
-        await interaction.followup.send(f"❌ No Kurdish songs found for: **{query}**")
-
-@bot.tree.command(name="queue", description="Show current queue")
-async def slash_queue(interaction: discord.Interaction):
-    try:
-        queue = bot.get_queue(interaction.guild.id)
-        current = bot.get_current_song(interaction.guild.id)
-        
-        if not queue and not current:
-            await interaction.response.send_message("📭 The queue is empty!")
-            return
-        
-        embed = Embed(title="📋 Music Queue", color=Color.blue())
-        
-        if current:
-            embed.add_field(
-                name="🎵 Now Playing",
-                value=f"**{current.get('title', 'Unknown')}**",
-                inline=False
-            )
-        
-        if queue:
-            queue_list = []
-            for i, song in enumerate(list(queue)[:10], 1):
-                title = song.get('title', 'Unknown')[:45]
-                queue_list.append(f"`{i}.` **{title}...**")
-            
-            embed.add_field(
-                name=f"📝 Next Songs ({len(queue)} total)",
-                value="\n".join(queue_list) if queue_list else "No upcoming songs",
-                inline=False
-            )
-        
-        await interaction.response.send_message(embed=embed)
-    except Exception as e:
-        await interaction.response.send_message(f"❌ Error: {str(e)[:100]}")
-
-@bot.tree.command(name="skip", description="Skip current song")
-async def slash_skip(interaction: discord.Interaction):
-    if not interaction.guild.voice_client or not interaction.guild.voice_client.is_playing():
-        await interaction.response.send_message("❌ No song playing!")
-        return
-    
-    current = bot.get_current_song(interaction.guild.id)
-    interaction.guild.voice_client.stop()
-    await interaction.response.send_message(f"⏭️ Skipped: **{current.get('title', 'Song')}**")
-
-@bot.tree.command(name="stop", description="Stop playback")
-async def slash_stop(interaction: discord.Interaction):
-    try:
-        queue = bot.get_queue(interaction.guild.id)
-        queue.clear()
-        bot.set_current_song(interaction.guild.id, None)
-        
-        if interaction.guild.voice_client:
-            await interaction.guild.voice_client.disconnect()
-            await interaction.response.send_message("⏹️ Stopped and disconnected.")
-        else:
-            await interaction.response.send_message("❌ Not in a voice channel!")
-    except Exception as e:
-        await interaction.response.send_message(f"❌ Error: {str(e)[:100]}")
-
-@bot.tree.command(name="loop", description="Toggle loop mode")
-async def slash_loop(interaction: discord.Interaction):
-    if not bot.get_current_song(interaction.guild.id):
-        await interaction.response.send_message("❌ No song playing!")
-        return
-    
-    loop_status = bot.toggle_loop(interaction.guild.id)
-    await interaction.response.send_message(f"🔄 Loop: {'✅ Enabled' if loop_status else '❌ Disabled'}")
-
-@bot.tree.command(name="volume", description="Set volume (0-200%)")
-async def slash_volume(interaction: discord.Interaction, level: int):
-    if level < 0 or level > 200:
-        await interaction.response.send_message("❌ Volume must be 0-200!")
-        return
-    
-    bot.set_volume(interaction.guild.id, level)
-    await interaction.response.send_message(f"🔊 Volume: **{level}%**")
-
-@bot.tree.command(name="nowplaying", description="Show currently playing song")
-async def slash_nowplaying(interaction: discord.Interaction):
-    current = bot.get_current_song(interaction.guild.id)
-    if not current:
-        await interaction.response.send_message("❌ No song playing!")
-        return
-    
-    embed = Embed(
-        title="🎵 Now Playing",
-        description=f"**{current.get('title', 'Unknown')}**",
-        color=Color.green()
-    )
-    
-    if current.get('thumbnail'):
-        embed.set_thumbnail(url=current['thumbnail'])
-    
-    embed.add_field(name="⏱️ Duration", value=current.get('duration', 'N/A'), inline=True)
-    embed.add_field(name="👤 Channel", value=current.get('channel', 'Unknown'), inline=True)
-    embed.add_field(name="🔊 Volume", value=f"{bot.get_volume(interaction.guild.id)}%", inline=True)
-    
-    await interaction.response.send_message(embed=embed)
 
 # ========== EVENTS ==========
 
@@ -860,8 +735,7 @@ async def on_ready():
     logger.info(f'📊 Connected to {len(bot.guilds)} servers')
     logger.info(f'🇰🇲 Loaded {len(ALL_KURDISH_SONGS)} Kurdish songs!')
     logger.info(f'📝 Prefix: {PREFIX}')
-    logger.info(f'💡 Try: {PREFIX}test to see if bot responds!')
-    logger.info(f'💡 Try: {PREFIX}play rostam sabir')
+    logger.info(f'💡 Try: $test to see if bot responds!')
     
     await bot.change_presence(
         activity=Activity(
@@ -879,9 +753,7 @@ async def on_ready():
 
 @bot.event
 async def on_command_error(ctx, error):
-    """Handle command errors"""
     if isinstance(error, commands.CommandNotFound):
-        # Don't log command not found errors
         return
     elif isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ You don't have permission!")

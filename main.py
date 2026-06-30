@@ -33,7 +33,8 @@ KURDISH_SONG_DATABASE = {
     'rojan': ['kurdistan', 'azadî', 'serxwebûn', 'xwezî', 'keça kurd'],
     'kurmancî': ['strana kurmancî', 'kilama kurmancî', 'dengê kurmancî'],
     'soranî': ['strana soranî', 'kilama soranî', 'dengê soranî'],
-    'dengbej': ['kilama dengbêj', 'strana dengbêj', 'dengê dengbêj']
+    'dengbej': ['kilama dengbêj', 'strana dengbêj', 'dengê dengbêj'],
+    'rostam sabir': ['xewn', 'evîn', 'derd', 'kurdistan', 'azadî', 'stran', 'delal', 'dil']
 }
 
 # Flatten the database
@@ -48,7 +49,7 @@ logger.info(f"📚 Loaded {len(ALL_KURDISH_SONGS)} Kurdish songs")
 class MusicBot(commands.Bot):
     def __init__(self):
         # Enable ALL required intents
-        intents = discord.Intents.all()  # This enables everything
+        intents = discord.Intents.all()
         
         super().__init__(
             command_prefix=PREFIX,
@@ -201,11 +202,9 @@ class MusicPlayer:
                 check_file = f"/tmp/audio_{url_hash}{ext}"
                 if os.path.exists(check_file) and os.path.getsize(check_file) > 10000:
                     logger.info(f"✅ Downloaded: {check_file}")
-                    # Rename to .mp3 if needed
                     if not check_file.endswith('.mp3'):
                         new_file = f"/tmp/audio_{url_hash}.mp3"
                         try:
-                            # Convert with ffmpeg
                             cmd = ['ffmpeg', '-i', check_file, '-acodec', 'libmp3lame', '-q:a', '2', new_file, '-y', '-loglevel', 'quiet']
                             await asyncio.to_thread(subprocess.run, cmd, capture_output=True)
                             os.remove(check_file)
@@ -338,20 +337,73 @@ class MusicPlayer:
 bot = MusicBot()
 player = MusicPlayer(bot)
 
+# ========== DIAGNOSTIC COMMANDS ==========
+
+@bot.event
+async def on_message(message):
+    """Process messages with diagnostic logging"""
+    if message.author.bot:
+        return
+    
+    # Log all messages for debugging
+    if message.content.startswith(PREFIX):
+        logger.info(f"📝 Command received: {message.content} from {message.author.name}")
+    
+    # Process commands
+    await bot.process_commands(message)
+
+@bot.command(name='test', aliases=['t'])
+async def test_command(ctx):
+    """Test if bot responds"""
+    await ctx.send("✅ Bot is responding! Your prefix is `$`")
+    logger.info(f"✅ Test command executed by {ctx.author.name}")
+
+@bot.command(name='ping')
+async def ping(ctx):
+    """Check bot latency"""
+    latency = round(bot.latency * 1000)
+    await ctx.send(f"🏓 Pong! Latency: {latency}ms")
+    logger.info(f"✅ Ping command executed by {ctx.author.name}")
+
+@bot.command(name='server')
+async def server_info(ctx):
+    """Show server info"""
+    embed = Embed(
+        title="📊 Server Info",
+        color=Color.blue()
+    )
+    embed.add_field(name="Server Name", value=ctx.guild.name, inline=True)
+    embed.add_field(name="Members", value=ctx.guild.member_count, inline=True)
+    embed.add_field(name="Channels", value=len(ctx.guild.channels), inline=True)
+    embed.add_field(name="Bot Prefix", value=PREFIX, inline=True)
+    embed.add_field(name="Bot Latency", value=f"{round(bot.latency * 1000)}ms", inline=True)
+    await ctx.send(embed=embed)
+    logger.info(f"✅ Server info command executed by {ctx.author.name}")
+
+@bot.command(name='whoami')
+async def whoami(ctx):
+    """Show user info"""
+    await ctx.send(f"👤 You are **{ctx.author.name}** (ID: {ctx.author.id})")
+    logger.info(f"✅ Whoami command executed by {ctx.author.name}")
+
 # ========== TEXT COMMANDS ==========
 
 @bot.command(name='play', aliases=['p'])
 async def play(ctx, *, query):
     """Play ANY song - including Kurdish songs!"""
     if not query:
-        await ctx.send("❌ Please provide a song name!")
+        await ctx.send("❌ Please provide a song name!\nExample: `$play rostam sabir`")
         return
     
-    await ctx.send("🔍 Searching...")
+    await ctx.send(f"🔍 Searching for: **{query}**...")
+    logger.info(f"🎵 Play command: {query} by {ctx.author.name}")
+    
     try:
         result = await player.play_song(ctx, query)
         if result:
             await ctx.send(f"🎵 Added: **{result.get('title', 'Song')}**")
+        else:
+            await ctx.send(f"❌ Could not find: **{query}**")
     except Exception as e:
         logger.error(f"Play error: {e}")
         await ctx.send(f"❌ Error: {str(e)[:100]}")
@@ -632,6 +684,17 @@ async def help_command(ctx):
         inline=False
     )
     
+    embed.add_field(
+        name="🛠️ Diagnostic Commands",
+        value=(
+            "`$test` - Test if bot responds\n"
+            "`$ping` - Check bot latency\n"
+            "`$server` - Show server info\n"
+            "`$whoami` - Show your info"
+        ),
+        inline=False
+    )
+    
     embed.set_footer(text=f"🎵 Prefix: {PREFIX} | 🇰🇲 Kurdish Music Bot")
     await ctx.send(embed=embed)
 
@@ -797,7 +860,8 @@ async def on_ready():
     logger.info(f'📊 Connected to {len(bot.guilds)} servers')
     logger.info(f'🇰🇲 Loaded {len(ALL_KURDISH_SONGS)} Kurdish songs!')
     logger.info(f'📝 Prefix: {PREFIX}')
-    logger.info(f'💡 Try: {PREFIX}play <song name>')
+    logger.info(f'💡 Try: {PREFIX}test to see if bot responds!')
+    logger.info(f'💡 Try: {PREFIX}play rostam sabir')
     
     await bot.change_presence(
         activity=Activity(
@@ -814,18 +878,10 @@ async def on_ready():
         logger.error(f"Slash sync error: {e}")
 
 @bot.event
-async def on_message(message):
-    """Process messages"""
-    if message.author.bot:
-        return
-    
-    # Process commands
-    await bot.process_commands(message)
-
-@bot.event
 async def on_command_error(ctx, error):
     """Handle command errors"""
     if isinstance(error, commands.CommandNotFound):
+        # Don't log command not found errors
         return
     elif isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ You don't have permission!")

@@ -12578,4 +12578,4 @@ if not token:
     raise RuntimeError("No DISCORD_TOKEN found. Set it in your .env file or token.txt.")
 
 bot.run(token, log_handler=handler, log_level=logging.DEBUG)
- 
+  

@@ -914,37 +914,68 @@ _DEFAULT_UA = (
     "Chrome/125.0.0.0 Safari/537.36"
 )
 
+# Headers that FFmpeg must NOT receive — they break chunked / gzip negotiation
+_SKIP_HEADERS = frozenset({"transfer-encoding", "content-length", "accept-encoding"})
+
+
+def _build_ffmpeg_headers(http_headers: dict) -> str:
+    """
+    Convert a yt-dlp http_headers dict into FFmpeg's -headers string format.
+
+    FFmpeg expects:   "Key1: Val1\\r\\nKey2: Val2\\r\\n"
+    (literal backslash-r-backslash-n as the CRLF separator — NOT actual \\r\\n bytes)
+
+    Returns an empty string when there are no usable headers.
+    """
+    merged = {}
+
+    # Ensure we always have a User-Agent
+    has_ua = any(k.lower() == "user-agent" for k in (http_headers or {}))
+    if not has_ua:
+        merged["User-Agent"] = _DEFAULT_UA
+
+    for k, v in (http_headers or {}).items():
+        if k.lower() not in _SKIP_HEADERS:
+            merged[k] = v
+
+    if not merged:
+        return ""
+
+    parts = [f"{k}: {v}" for k, v in merged.items()]
+    # Join with literal \r\n that FFmpeg interprets as CRLF header separators
+    return "\\r\\n".join(parts) + "\\r\\n"
+
 
 def create_ffmpeg_source(stream_url, volume, filter_name, http_headers: dict = None):
     """
     Create a discord audio source from a direct stream URL.
 
     http_headers: dict of headers yt-dlp says are required for this stream.
-                  If None, a standard User-Agent is used automatically.
+                  Passed in full to FFmpeg via -headers so CDN 403s are avoided.
+                  Falls back to a default User-Agent when None / empty.
     """
     if not stream_url:
         return None
 
     af = FILTERS.get(filter_name, FILTERS["none"])["af"]
 
-    # ── Build the User-Agent string ──────────────────────────────────────────
-    ua = _DEFAULT_UA
-    if http_headers:
-        ua = http_headers.get("User-Agent") or http_headers.get("user-agent") or ua
+    # ── Build full header block for FFmpeg ───────────────────────────────────
+    headers_str = _build_ffmpeg_headers(http_headers)
 
     # ── Build before_options ─────────────────────────────────────────────────
-    # -reconnect* flags make FFmpeg retry when the CDN drops the connection
-    # (common with YouTube signed URLs that expire mid-stream).
-    # -user_agent sets the UA so CDN servers don't reject the request.
+    # -reconnect* flags make FFmpeg retry when the YouTube CDN drops mid-stream.
+    # -headers passes the full yt-dlp header set so CDN servers don't 403.
     before_opts = (
         "-reconnect 1 "
         "-reconnect_streamed 1 "
         "-reconnect_delay_max 5 "
-        "-reconnect_on_network_error 1 "
-        f"-user_agent \"{ua}\""
+        "-reconnect_on_network_error 1"
     )
+    if headers_str:
+        # shlex.split (used by discord.py) handles quoted strings correctly
+        before_opts += f' -headers "{headers_str}"'
 
-    # ── Audio-only output, optional filter chain ─────────────────────────────
+    # ── Audio-only output, optional DSP filter chain ─────────────────────────
     options = "-vn"          # strip video track (important for combined streams)
     if af:
         options += f" -af {af}"

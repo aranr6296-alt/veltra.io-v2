@@ -27,34 +27,10 @@ TOKEN = os.getenv('DISCORD_TOKEN', 'YOUR_BOT_TOKEN_HERE')
 PREFIX = os.getenv('PREFIX', '$')
 MAX_QUEUE_SIZE = 500
 
-# FFmpeg options
+# FFmpeg options - FIXED for better audio
 FFMPEG_OPTIONS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
     'options': '-vn -bufsize 64k -loglevel quiet'
-}
-
-# yt-dlp options
-YDL_OPTIONS = {
-    'format': 'bestaudio/best',
-    'postprocessors': [{
-        'key': 'FFmpegExtractAudio',
-        'preferredcodec': 'mp3',
-        'preferredquality': '128',
-    }],
-    'outtmpl': '/tmp/audio_%(title)s_%(id)s.%(ext)s',
-    'restrictfilenames': True,
-    'noplaylist': False,
-    'nocheckcertificate': True,
-    'ignoreerrors': True,
-    'logtostderr': False,
-    'quiet': True,
-    'no_warnings': True,
-    'default_search': 'auto',
-    'source_address': '0.0.0.0',
-    'socket_timeout': 30,
-    'retries': 3,
-    'fragment_retries': 3,
-    'extract_flat': False
 }
 
 # ============== KURDISH SONG DATABASE ==============
@@ -193,7 +169,7 @@ class MusicPlayer:
 
     def format_duration(self, seconds):
         if not seconds or seconds <= 0:
-            return 'Live'
+            return 'N/A'
         try:
             minutes = int(seconds // 60)
             seconds = int(seconds % 60)
@@ -295,40 +271,111 @@ class MusicPlayer:
             return []
 
     async def download_audio(self, url):
-        """Download audio with retry logic"""
+        """Download audio with FIXED yt-dlp options"""
         try:
+            # Create unique filename
+            import hashlib
+            url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+            filename = f"/tmp/audio_{url_hash}.mp3"
+            
+            # Check if file already exists
+            if os.path.exists(filename):
+                logger.info(f"✅ Using cached audio: {filename}")
+                return filename
+            
+            # yt-dlp options - FIXED for proper audio download
             ydl_opts = {
                 'format': 'bestaudio/best',
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': 'mp3',
-                    'preferredquality': '128',
+                    'preferredquality': '192',
                 }],
-                'outtmpl': '/tmp/audio_%(title)s_%(id)s.%(ext)s',
+                'outtmpl': filename.replace('.mp3', ''),
                 'restrictfilenames': True,
                 'nocheckcertificate': True,
                 'ignoreerrors': True,
                 'quiet': True,
                 'no_warnings': True,
                 'socket_timeout': 30,
-                'retries': 3,
-                'noplaylist': True
+                'retries': 5,
+                'fragment_retries': 5,
+                'noplaylist': True,
+                'extract_audio': True,
+                'audio_format': 'mp3',
+                'audio_quality': 0,
+                'progress_hooks': [],
             }
+            
+            logger.info(f"⬇️ Downloading: {url[:50]}...")
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 try:
+                    # Download the audio
                     info = await asyncio.to_thread(ydl.extract_info, url, download=True)
+                    
                     if info:
-                        filename = ydl.prepare_filename(info)
-                        for ext in ['mp3', 'webm', 'm4a', 'opus']:
-                            check_file = filename.rsplit('.', 1)[0] + '.' + ext
-                            if os.path.exists(check_file):
-                                filename = check_file
-                                break
-                        if os.path.exists(filename):
-                            return filename
+                        # Check for the file
+                        base_filename = filename.replace('.mp3', '')
+                        possible_files = [
+                            f"{base_filename}.mp3",
+                            f"{base_filename}.webm",
+                            f"{base_filename}.m4a",
+                            f"{base_filename}.opus"
+                        ]
+                        
+                        for file_path in possible_files:
+                            if os.path.exists(file_path):
+                                # If it's not mp3, convert to mp3
+                                if not file_path.endswith('.mp3'):
+                                    new_path = file_path.rsplit('.', 1)[0] + '.mp3'
+                                    try:
+                                        # Use ffmpeg to convert
+                                        cmd = ['ffmpeg', '-i', file_path, '-acodec', 'libmp3lame', '-q:a', '2', new_path, '-y']
+                                        await asyncio.to_thread(subprocess.run, cmd, capture_output=True)
+                                        os.remove(file_path)
+                                        file_path = new_path
+                                    except:
+                                        pass
+                                
+                                if os.path.exists(file_path) and os.path.getsize(file_path) > 10000:
+                                    logger.info(f"✅ Downloaded: {file_path}")
+                                    return file_path
+                                else:
+                                    # Try to find any file with the base name
+                                    import glob
+                                    for f in glob.glob(f"{base_filename}*"):
+                                        if os.path.exists(f) and os.path.getsize(f) > 10000:
+                                            logger.info(f"✅ Downloaded: {f}")
+                                            return f
+                    
                 except Exception as e:
                     logger.error(f"Download error: {e}")
+            
+            # Fallback: try using yt-dlp with simpler options
+            try:
+                logger.info("🔄 Trying fallback download method...")
+                ydl_opts_simple = {
+                    'format': 'bestaudio',
+                    'outtmpl': filename.replace('.mp3', ''),
+                    'quiet': True,
+                    'no_warnings': True,
+                    'noplaylist': True,
+                    'extract_audio': True,
+                    'audio_format': 'mp3',
+                }
+                
+                with yt_dlp.YoutubeDL(ydl_opts_simple) as ydl:
+                    info = await asyncio.to_thread(ydl.extract_info, url, download=True)
+                    if info:
+                        base_filename = filename.replace('.mp3', '')
+                        for ext in ['.mp3', '.webm', '.m4a', '.opus']:
+                            check_file = base_filename + ext
+                            if os.path.exists(check_file) and os.path.getsize(check_file) > 10000:
+                                logger.info(f"✅ Downloaded (fallback): {check_file}")
+                                return check_file
+            except Exception as e:
+                logger.error(f"Fallback download error: {e}")
             
             return None
             
@@ -342,8 +389,7 @@ class MusicPlayer:
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
-                'extract_flat': True,
-                'force_generic_extractor': False,
+                'extract_flat': False,
                 'socket_timeout': 10,
                 'retries': 2
             }
@@ -510,14 +556,23 @@ class MusicPlayer:
                 await self.play_next(ctx)
                 return
             
-            # Create audio source
-            volume = self.bot.get_volume(ctx.guild.id) / 100
-            volume_filter = f"volume={volume}" if volume != 1.0 else ""
+            # Get file size to verify
+            file_size = os.path.getsize(audio_file)
+            if file_size < 10000:  # Less than 10KB is too small
+                await ctx.send(f"❌ Audio file too small: {song.get('title', 'Unknown')}")
+                await self.play_next(ctx)
+                return
             
+            logger.info(f"🎵 Playing: {song.get('title')} ({file_size} bytes)")
+            
+            # Create audio source with FIXED FFmpeg options
+            volume = self.bot.get_volume(ctx.guild.id) / 100
+            
+            # Use streaming for better performance
             audio = FFmpegPCMAudio(
                 audio_file,
                 before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-                options=f'-vn -bufsize 64k -loglevel quiet -af "{volume_filter}"' if volume_filter else '-vn -bufsize 64k -loglevel quiet'
+                options=f'-vn -bufsize 64k -loglevel quiet -af "volume={volume}"'
             )
             
             def after_playing(error):
@@ -526,10 +581,12 @@ class MusicPlayer:
                 try:
                     if os.path.exists(audio_file):
                         os.remove(audio_file)
+                        logger.info(f"🗑️ Removed: {audio_file}")
                 except:
                     pass
                 asyncio.run_coroutine_threadsafe(self.play_next(ctx), self.bot.loop)
             
+            # Play the audio
             ctx.voice_client.play(audio, after=after_playing)
             
             # Send now playing embed
@@ -570,8 +627,8 @@ class MusicBot(commands.Bot):
     def __init__(self):
         # Enable all required intents
         intents = discord.Intents.default()
-        intents.message_content = True  # REQUIRED for reading messages
-        intents.voice_states = True     # REQUIRED for voice
+        intents.message_content = True
+        intents.voice_states = True
         intents.guilds = True
         intents.members = True
         
@@ -601,7 +658,6 @@ class MusicBot(commands.Bot):
         logger.info(f"🤖 Bot initialized with {len(self.kurdish_finder.all_kurdish_songs)} Kurdish songs")
 
     async def setup_hook(self):
-        """Setup slash commands"""
         try:
             await self.tree.sync()
             logger.info("✅ Slash commands synced")
@@ -1174,7 +1230,7 @@ async def on_error(event, *args, **kwargs):
 
 if __name__ == "__main__":
     if not TOKEN or TOKEN == 'YOUR_BOT_TOKEN_HERE':
-        logger.error("❌ No bot token found! Set DISCORD_TOKEN in .env file")
+        logger.error("❌ No bot token found! Set DISCOCK_TOKEN in .env file")
         sys.exit(1)
     
     try:
@@ -1186,4 +1242,3 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"❌ Failed to start: {e}")
         sys.exit(1)
-        
